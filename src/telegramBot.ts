@@ -282,7 +282,7 @@ async function applyTpTargets(chatId: number, raw: string): Promise<void> {
 }
 
 function enabled(): boolean {
-  return Boolean(CONFIG.TELEGRAM_BOT_TOKEN && CONFIG.TELEGRAM_CHAT_ID);
+  return Boolean(CONFIG.TELEGRAM_BOT_TOKEN);
 }
 
 function apiUrl(method: string): string {
@@ -3781,11 +3781,15 @@ async function handleAdoptConfirmed(chatId: number, data: string): Promise<void>
 
 export function startTelegramBot(): () => void {
   if (!enabled()) {
-    logger.info("[telegram] disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable");
+    logger.info("[telegram] disabled — set TELEGRAM_BOT_TOKEN to enable");
     return () => {};
   }
 
-  const allowedChat = String(CONFIG.TELEGRAM_CHAT_ID);
+  const allowedChat = String(CONFIG.TELEGRAM_CHAT_ID || "").trim();
+  const restrictChat = allowedChat.length > 0;
+  if (!restrictChat) {
+    logger.warn("[telegram] TELEGRAM_CHAT_ID is empty — accepting commands from any chat that can reach the bot");
+  }
   let offset = 0;
   let stopped = false;
 
@@ -3835,7 +3839,8 @@ export function startTelegramBot(): () => void {
           offset = Math.max(offset, u.update_id + 1);
 
           const fromChat = u.message?.chat.id ?? u.callback_query?.message?.chat.id;
-          if (fromChat === undefined || String(fromChat) !== allowedChat) continue;
+          if (fromChat === undefined) continue;
+          if (restrictChat && String(fromChat) !== allowedChat) continue;
 
           if (u.callback_query) {
             await handleCallback(u.callback_query).catch((e) =>
