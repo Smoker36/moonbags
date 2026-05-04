@@ -398,6 +398,72 @@ function fmtUptime(bootAt: number): string {
 // ---------------------------------------------------------------------------
 // Settings menus — structured hub, exit strategy submenu, and legacy flat view.
 // ---------------------------------------------------------------------------
+
+
+type GmgnFilterPreset = "strict" | "balanced" | "relaxed";
+
+function applyGmgnFilterPreset(preset: GmgnFilterPreset): void {
+  updateRuntimeSettings((draft) => {
+    const base = draft.signals.gmgn.baseline;
+    const trig = draft.signals.gmgn.trigger;
+    if (preset == "strict") {
+      base.minHolders = 250;
+      base.minLiquidityUsd = 15_000;
+      base.maxRugRatio = 0.2;
+      trig.minScans = 3;
+      trig.minBuySellRatio = 1.2;
+      trig.minSmartOrKolCount = 3;
+    } else if (preset == "balanced") {
+      base.minHolders = 120;
+      base.minLiquidityUsd = 7_500;
+      base.maxRugRatio = 0.3;
+      trig.minScans = 2;
+      trig.minBuySellRatio = 1.0;
+      trig.minSmartOrKolCount = 2;
+    } else {
+      base.minHolders = 60;
+      base.minLiquidityUsd = 3_000;
+      base.maxRugRatio = 0.45;
+      trig.minScans = 1;
+      trig.minBuySellRatio = 0.8;
+      trig.minSmartOrKolCount = 1;
+    }
+  });
+}
+
+async function sendGmgnFiltersMenu(chatId: number): Promise<void> {
+  const g = getRuntimeSettings().signals.gmgn;
+  const text =
+    `<b>🧪 GMGN Filters</b>
+
+` +
+    `Holders ≥ <b>${g.baseline.minHolders}</b>
+` +
+    `Liquidity ≥ <b>$${Math.round(g.baseline.minLiquidityUsd).toLocaleString("en-US")}</b>
+` +
+    `Rug ratio ≤ <b>${g.baseline.maxRugRatio}</b>
+` +
+    `Min scans: <b>${g.trigger.minScans}</b>
+` +
+    `Buy/Sell ≥ <b>${g.trigger.minBuySellRatio}</b>
+` +
+    `Smart/KOL ≥ <b>${g.trigger.minSmartOrKolCount}</b>
+
+` +
+    `<i>Use presets to quickly relax/tighten alert gating when GMGN flow is too noisy or too quiet.</i>`;
+  await tgPost("sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🟢 Relaxed", callback_data: "gmgn:preset:relaxed" }, { text: "🟡 Balanced", callback_data: "gmgn:preset:balanced" }],
+        [{ text: "🔴 Strict", callback_data: "gmgn:preset:strict" }, { text: "↩️ Back", callback_data: "menu:settings" }],
+      ],
+    },
+  });
+}
+
 const SETTINGS_LABELS: Record<SettableKey, string> = {
   BUY_SIZE_SOL:             "💰 Buy size",
   MAX_CONCURRENT_POSITIONS: "📊 Max positions",
@@ -432,7 +498,8 @@ async function sendSettingsMenu(chatId: number): Promise<void> {
     reply_markup: {
       inline_keyboard: [
         [{ text: "🎯 Exit Strategy", callback_data: "settings:exit" }, { text: "🛡 Risk Controls", callback_data: "settings:risk" }],
-        [{ text: "🧰 Live Settings", callback_data: "settings:live" }, { text: "🏠 Dashboard", callback_data: "menu:start" }],
+        [{ text: "🧰 Live Settings", callback_data: "settings:live" }, { text: "🧪 GMGN Filters", callback_data: "settings:gmgn_filters" }],
+        [{ text: "🏠 Dashboard", callback_data: "menu:start" }],
       ],
     },
   });
@@ -947,6 +1014,12 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
     return;
   }
 
+  if (data === "settings:gmgn_filters") {
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
+    await sendGmgnFiltersMenu(chatId);
+    return;
+  }
+
   if (data === "settings:tp:edit") {
     await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
     await promptForTpTargets(chatId);
@@ -1034,6 +1107,19 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
     });
     await handleWss(chatId);
     logger.info({ enabled }, "[okx-wss] toggled via telegram");
+    return;
+  }
+
+  if (data.startsWith("gmgn:preset:")) {
+    const preset = data.slice("gmgn:preset:".length);
+    if (preset !== "strict" && preset !== "balanced" && preset !== "relaxed") {
+      await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: "Unknown preset" });
+      return;
+    }
+    applyGmgnFilterPreset(preset);
+    await tgPost("answerCallbackQuery", { callback_query_id: cq.id, text: `GMGN preset: ${preset}` });
+    await sendGmgnFiltersMenu(chatId);
+    logger.info({ preset }, "[settings] gmgn filter preset updated via telegram");
     return;
   }
 
