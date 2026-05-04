@@ -495,6 +495,50 @@ On first boot, MoonBags creates `state/settings.json` from the env defaults. Tel
 }
 ```
 
+### Where to set GMGN strategy filters (`.env` vs `state/settings.json`)
+
+Use **`state/settings.json`** (or Telegram `/settings`) for GMGN strategy behavior, including:
+
+- `gmgnStrategy.dynamicFeeGate.mode = "marketcap_div_5"`
+- `gmgnStrategy.filters.requirePumpfunMigration`
+- `gmgnStrategy.filters.minPriceDropPctAfterMigration`
+- `gmgnStrategy.filters.recoveryMinReboundPct`
+- `gmgnStrategy.filters.minVolumeToMcapRatio` and `gmgnStrategy.filters.volumeToMcapWindow`
+
+Use **`.env`** only for secrets and runtime credentials like `GMGN_API_KEY`, `JUP_API_KEY`, `HELIUS_API_KEY`, wallet key, and Telegram IDs.
+
+- After `.env` changes: restart the process (`pm2 restart moonbags --update-env`).
+- After `state/settings.json` changes: settings persist as strategy config and can also be edited live in Telegram.
+
+**Copy-paste example (`state/settings.json` fragment):**
+
+```json
+{
+  "signals": {
+    "gmgn": {
+      "filters": {
+        "requirePumpfunMigration": true,
+        "minPriceDropPctAfterMigration": 15,
+        "recoveryMinReboundPct": 2,
+        "recoveryLookbackScans": 4,
+        "recoveryMinHigherLows": 2,
+        "recoveryMinBuySellRatio": 1.1,
+        "recoveryRequirePositiveNetFlow": true,
+        "minVolumeToMcapRatio": 10,
+        "volumeToMcapWindow": "24h"
+      },
+      "allowedMigrationSources": ["pump.fun"]
+    }
+  },
+  "gmgnStrategy": {
+    "dynamicFeeGate": {
+      "enabled": true,
+      "mode": "marketcap_div_5"
+    }
+  }
+}
+```
+
 **Security note:** `.env` should never be committed. Add it to `.gitignore` (already present in this repo).
 
 ---
