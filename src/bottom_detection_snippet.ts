@@ -2,9 +2,18 @@
  * Detect if token price is at BOTTOM after pumpfun migration
  * Tracks lowest price and detects recovery signal
  */
+type BottomSnippetCandidate = {
+  priceUsd?: number;
+};
+
+type BottomSnippetWatchEntry = {
+  firstPrice?: number;
+  sourceMeta?: Record<string, unknown>;
+};
+
 function detectBottomPrice(
-  candidate: Partial<GmgnSignalCandidate>,
-  existing?: GmgnWatchEntry
+  candidate: Partial<BottomSnippetCandidate>,
+  existing?: BottomSnippetWatchEntry
 ): {
   isAtBottom: boolean;
   currentPrice: number;

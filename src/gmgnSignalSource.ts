@@ -661,6 +661,10 @@ function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
     platform === "pump.fun" || platform === "pumpfun" || platform === "pump" ? "pump.fun" : platform || undefined;
   const isPumpPlatform =
     candidate.source === "trenches" ||
+    normalizedSource === "pump.fun" ||
+    normalizedSource === "pumpfun" ||
+    normalizedSource === "pump" ||
+    rawPlatform.includes("pump");
 
   if (!isPumpPlatform) {
     return { isMigrated: false, confidence: 0 };
@@ -1017,9 +1021,7 @@ function maybeRejectTrigger(candidate: GmgnSignalCandidate, settings: GmgnSettin
   const liquidityDropPct = firstLiquidity > 0 ? Math.max(0, ((firstLiquidity - candidate.liquidityUsd) / firstLiquidity) * 100) : 0;
   if (liquidityDropPct > trigger.maxLiquidityDropPct) return `liquidity drop ${liquidityDropPct.toFixed(0)}% > ${trigger.maxLiquidityDropPct}%`;
 
-
-
-    }
+  if (settings.filters.requirePumpfunMigration) {
     const recovery = evaluateRecovery(candidate, existing, settings);
     candidate.recoveryConfirmedAt = recovery.confirmedAt;
     candidate.recoveryReason = recovery.ok ? recovery.reason : undefined;
