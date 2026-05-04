@@ -256,7 +256,7 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     enabled: false,
     limit: 10,
     types: ["new_creation", "near_completion", "completed"],
-    launchpadPlatforms: ["Pump.fun", "pump_mayhem", "letsbonk"],
+    launchpadPlatforms: [],
     filterPreset: "safe",
     minSmartDegenCount: 1,
     sortBy: "smart_degen_count",
