@@ -110,6 +110,13 @@ function fmtClock(ts: number): string {
   return d.toTimeString().slice(0, 8); // "HH:MM:SS"
 }
 
+function extractVolumeRatio(reason?: string): string | null {
+  if (!reason) return null;
+  const m = reason.match(/volume\/mcap\((5m|1h|24h)\)\s+([0-9.]+x\s+<\s+[0-9.]+x)/i);
+  if (!m) return null;
+  return `VOL/MCAP ${m[1]} ${m[2]}`;
+}
+
 function AlertItem({ a, closed, info }: { a: Alert; closed?: ClosedTrade; info?: TokenInfo }) {
   const filtered = a.action === "filtered";
   const fired = a.action === "fired";
@@ -193,10 +200,20 @@ function AlertItem({ a, closed, info }: { a: Alert; closed?: ClosedTrade; info?:
                 {info.organicScoreLabel}
               </span>
             )}
+            {extractVolumeRatio(a.reason) && (
+              <span className="px-1 bg-surface-container-highest text-[8px] font-mono text-coral uppercase">
+                {extractVolumeRatio(a.reason)}
+              </span>
+            )}
           </div>
         </div>
       </div>
       <div className="shrink-0 ml-2">{status}</div>
+      {a.reason && (
+        <div className="mt-2 text-[10px] font-mono text-muted-foreground truncate" title={a.reason}>
+          {a.reason}
+        </div>
+      )}
     </div>
   );
 }

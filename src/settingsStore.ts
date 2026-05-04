@@ -113,6 +113,8 @@ export type RuntimeSettings = {
         maxBotRate: number;
         maxCreatorBalanceRate: number;
         requireNotWashTrading: boolean;
+        minVolumeToMcapRatio: number;
+        volumeToMcapWindow: "5m" | "1h" | "24h";
       };
       trigger: {
         minScans: number;
@@ -274,6 +276,8 @@ function defaultSettings(): RuntimeSettings {
           maxBotRate: 0.45,
           maxCreatorBalanceRate: 0.2,
           requireNotWashTrading: true,
+          minVolumeToMcapRatio: 10,
+          volumeToMcapWindow: "24h",
         },
         trigger: {
           minScans: 10,
@@ -506,6 +510,11 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
           maxBotRate: num(gmgnBaseline.maxBotRate, defaults.signals.gmgn.baseline.maxBotRate, 0, 1),
           maxCreatorBalanceRate: num(gmgnBaseline.maxCreatorBalanceRate, defaults.signals.gmgn.baseline.maxCreatorBalanceRate, 0, 1),
           requireNotWashTrading: bool(gmgnBaseline.requireNotWashTrading, defaults.signals.gmgn.baseline.requireNotWashTrading),
+          minVolumeToMcapRatio: num(gmgnBaseline.minVolumeToMcapRatio, defaults.signals.gmgn.baseline.minVolumeToMcapRatio, 0, 10_000),
+          volumeToMcapWindow:
+            gmgnBaseline.volumeToMcapWindow === "5m" || gmgnBaseline.volumeToMcapWindow === "1h" || gmgnBaseline.volumeToMcapWindow === "24h"
+              ? gmgnBaseline.volumeToMcapWindow
+              : defaults.signals.gmgn.baseline.volumeToMcapWindow,
         },
         trigger: {
           minScans: Math.round(num(gmgnTrigger.minScans, defaults.signals.gmgn.trigger.minScans, 1, 20)),

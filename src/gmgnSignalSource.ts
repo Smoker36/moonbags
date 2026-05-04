@@ -83,6 +83,8 @@ type GmgnSettings = {
     // ===== CUSTOM STRATEGY FILTERS =====
     minMarketCapFeeUsd: number;
     minVolumeMcapRatio: number;
+    minVolumeToMcapRatio: number;
+    volumeToMcapWindow: "5m" | "1h" | "24h";
     requirePumpfunMigration: boolean;
     minPriceDropPctAfterMigration: number;
     minRsiForDump: number;
@@ -270,6 +272,8 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     // ===== CUSTOM STRATEGY DEFAULTS =====
     minMarketCapFeeUsd: 700,
     minVolumeMcapRatio: 10,
+    minVolumeToMcapRatio: 10,
+    volumeToMcapWindow: "24h",
     requirePumpfunMigration: true,
     minPriceDropPctAfterMigration: 15,
     minRsiForDump: 0,
@@ -436,6 +440,11 @@ function currentSettings(): GmgnSettings {
       // ===== CUSTOM STRATEGY FILTERS =====
       minMarketCapFeeUsd: Math.max(0, finite(filters.minMarketCapFeeUsd, DEFAULT_SETTINGS.filters.minMarketCapFeeUsd)),
       minVolumeMcapRatio: Math.max(0, finite(filters.minVolumeMcapRatio, DEFAULT_SETTINGS.filters.minVolumeMcapRatio)),
+      minVolumeToMcapRatio: Math.max(0, finite(filters.minVolumeToMcapRatio ?? filters.minVolumeMcapRatio, DEFAULT_SETTINGS.filters.minVolumeToMcapRatio)),
+      volumeToMcapWindow:
+        filters.volumeToMcapWindow === "5m" || filters.volumeToMcapWindow === "1h" || filters.volumeToMcapWindow === "24h"
+          ? filters.volumeToMcapWindow
+          : DEFAULT_SETTINGS.filters.volumeToMcapWindow,
       requirePumpfunMigration: filters.requirePumpfunMigration === undefined ? DEFAULT_SETTINGS.filters.requirePumpfunMigration : Boolean(filters.requirePumpfunMigration),
       minPriceDropPctAfterMigration: Math.max(0, finite(filters.minPriceDropPctAfterMigration, DEFAULT_SETTINGS.filters.minPriceDropPctAfterMigration)),
       minRsiForDump: Math.max(0, Math.min(100, finite(filters.minRsiForDump, DEFAULT_SETTINGS.filters.minRsiForDump))),
@@ -610,7 +619,7 @@ function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
     sourceMeta.platform === "Pump.fun" ||
     sourceMeta.platform === "pump_mayhem" ||
     raw.launchpad === "pump" ||
-    raw.platform?.toLowerCase?.().includes("pump");
+    (getMaybeString(raw.platform)?.toLowerCase().includes("pump") ?? false);
 
   if (!isPumpPlatform) {
     return { isMigrated: false, confidence: 0 };
@@ -672,27 +681,29 @@ function detectPostMigrationDump(
  */
 function checkVolumeMcapRatio(
   candidate: Partial<GmgnSignalCandidate>,
-  minRatio: number = 10
+  minRatio: number = 10,
+  window: "5m" | "1h" | "24h" = "24h"
 ): {
   hasGoodRatio: boolean;
   ratio: number;
-  volume24h?: number;
+  volumeWindowUsd: number;
+  window: "5m" | "1h" | "24h";
 } {
   const mcap = candidate.marketCapUsd ?? 0;
-  const volume =
-    (candidate.sourceMeta?.volume_24h as number) ??
-    (candidate.sourceMeta?.volume24h as number) ??
-    0;
+  const meta = candidate.sourceMeta ?? {};
+  const volumeByWindow = {
+    "5m": Number((meta.volume_5m as number) ?? (meta.volume5m as number) ?? 0),
+    "1h": Number((meta.volume_1h as number) ?? (meta.volume1h as number) ?? 0),
+    "24h": Number((meta.volume_24h as number) ?? (meta.volume24h as number) ?? 0),
+  } as const;
+  const volumeWindowUsd = Number.isFinite(volumeByWindow[window]) ? Math.max(0, volumeByWindow[window]) : 0;
+  const volumeToMcap = mcap > 0 ? volumeWindowUsd / mcap : 0;
 
-  if (mcap <= 0 || volume <= 0) {
-    return { hasGoodRatio: false, ratio: 0 };
-  }
-
-  const ratio = volume / mcap;
   return {
-    hasGoodRatio: ratio >= minRatio,
-    ratio: ratio,
-    volume24h: volume,
+    hasGoodRatio: volumeToMcap >= minRatio,
+    ratio: volumeToMcap,
+    volumeWindowUsd,
+    window,
   };
 }
 
@@ -791,10 +802,18 @@ function maybeReject(candidate: Partial<GmgnSignalCandidate>, _reason: string): 
   }
 
   // ===== CUSTOM STRATEGY: Volume / Marketcap Ratio =====
-  if (filters.minVolumeMcapRatio > 0) {
-    const volumeCheck = checkVolumeMcapRatio(candidate, filters.minVolumeMcapRatio);
+  if (filters.minVolumeToMcapRatio > 0) {
+    const volumeCheck = checkVolumeMcapRatio(candidate, filters.minVolumeToMcapRatio, filters.volumeToMcapWindow);
+    candidate.sourceMeta = {
+      ...candidate.sourceMeta,
+      volumeToMcap: volumeCheck.ratio,
+      volumeToMcapWindow: volumeCheck.window,
+      volumeWindowUsd: volumeCheck.volumeWindowUsd,
+      marketCapUsd: mcap,
+      minVolumeToMcapRatio: filters.minVolumeToMcapRatio,
+    };
     if (!volumeCheck.hasGoodRatio) {
-      return `volume/mcap ${volumeCheck.ratio.toFixed(2)}x < ${filters.minVolumeMcapRatio}x`;
+      return `volume/mcap(${volumeCheck.window}) ${volumeCheck.ratio.toFixed(2)}x < ${filters.minVolumeToMcapRatio}x`;
     }
   }
 
@@ -840,80 +859,26 @@ function maybeRejectTrigger(candidate: GmgnSignalCandidate, settings: GmgnSettin
   const trigger = settings.trigger;
   const existing = watchlist.get(candidate.mint);
   const scans = Math.max(existing ? 1 : 0, gmgnSnapshotCount(candidate.mint));
-  if (scans < trigger.minScans) {
-    return `scans ${scans} < ${trigger.minScans}`;
-  }
+  if (scans < trigger.minScans) return `scans ${scans} < ${trigger.minScans}`;
 
   const firstHolders = existing?.firstHolders ?? candidate.holders;
   const holderGrowthPct = firstHolders > 0 ? ((candidate.holders - firstHolders) / firstHolders) * 100 : 0;
-  if (holderGrowthPct < trigger.minHolderGrowthPct) {
-    return `holder growth ${holderGrowthPct.toFixed(1)}% < ${trigger.minHolderGrowthPct}%`;
-  }
+  if (holderGrowthPct < trigger.minHolderGrowthPct) return `holder growth ${holderGrowthPct.toFixed(1)}% < ${trigger.minHolderGrowthPct}%`;
   if (trigger.maxHolderGrowthPct > 0 && holderGrowthPct > trigger.maxHolderGrowthPct) {
     return `holder growth ${holderGrowthPct.toFixed(1)}% > ${trigger.maxHolderGrowthPct}% (bot inflation)`;
   }
 
   const firstLiquidity = existing?.firstLiquidityUsd ?? candidate.liquidityUsd;
   const liquidityDropPct = firstLiquidity > 0 ? Math.max(0, ((firstLiquidity - candidate.liquidityUsd) / firstLiquidity) * 100) : 0;
-  if (liquidityDropPct > trigger.maxLiquidityDropPct) {
-    return `liquidity drop ${liquidityDropPct.toFixed(0)}% > ${trigger.maxLiquidityDropPct}%`;
-  }
+  if (liquidityDropPct > trigger.maxLiquidityDropPct) return `liquidity drop ${liquidityDropPct.toFixed(0)}% > ${trigger.maxLiquidityDropPct}%`;
 
-  // ===== CUSTOM STRATEGY: Post-Migration Dump Detection =====
-  if (
-    settings.filters.requirePumpfunMigration &&
-    settings.filters.minPriceDropPctAfterMigration > 0
-  ) {
+  if (settings.filters.requirePumpfunMigration && settings.filters.minPriceDropPctAfterMigration > 0) {
     const migration = detectPumpfunMigration(candidate);
     if (migration.isMigrated) {
       const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
-      const dump = detectPostMigrationDump(candidate, {
-        priceUsd: firstPrice,
-        holders: firstHolders,
-      });
-
+      const dump = detectPostMigrationDump(candidate, { priceUsd: firstPrice, holders: firstHolders });
       if (dump.dropPct >= settings.filters.minPriceDropPctAfterMigration) {
-        candidate.sourceMeta = {
-          ...candidate.sourc// ===== CUSTOM STRATEGY: Dump to Bottom Detection =====
-if (settings.filters.requirePumpfunMigration) {
-  const migration = detectPumpfunMigration(candidate);
-  if (migration.isMigrated) {
-    // Track lowest price since migration
-    const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
-    const currentPrice = candidate.priceUsd ?? 0;
-    const lowestPrice = existing?.sourceMeta?.lowestPrice ?? firstPrice;
-    
-    // Update lowest price if current is lower
-    const newLowestPrice = Math.min(lowestPrice, currentPrice);
-    
-    // Check if price is at bottom (below lowest by small margin, then starting to recover)
-    const maxDropPct = ((firstPrice - newLowestPrice) / firstPrice) * 100;
-    const isRecovering = currentPrice > newLowestPrice * 1.02; // 2% above lowest = sign of recovery
-    const isAtBottom = newLowestPrice > 0 && maxDropPct > 10 && isRecovering; // Min 10% dump + signs of recovery
-    
-    if (isAtBottom) {
-      candidate.sourceMeta = {
-        ...candidate.sourceMeta,
-        bottomDetection: {
-          isAtBottom: true,
-          currentPrice,
-          lowestPrice: newLowestPrice,
-          maxDropPct: Math.round(maxDropPct * 100) / 100,
-          isRecovering,
-        },
-      };
-    } else {
-      // Still dumping or waiting for recovery
-      return `dumping to bottom... current: $${currentPrice.toFixed(6)}, lowest: $${newLowestPrice.toFixed(6)}, drop: ${maxDropPct.toFixed(1)}%`;
-    }
-  }
-}eMeta,
-          dumpDetection: {
-            isDumping: dump.isDumping,
-            dropPct: dump.dropPct,
-            holderTrend: dump.holderTrend,
-          },
-        };
+        candidate.sourceMeta = { ...candidate.sourceMeta, dumpDetection: { isDumping: dump.isDumping, dropPct: dump.dropPct, holderTrend: dump.holderTrend } };
       } else {
         return `post-migration drop ${dump.dropPct.toFixed(1)}% < ${settings.filters.minPriceDropPctAfterMigration}%`;
       }
@@ -921,28 +886,17 @@ if (settings.filters.requirePumpfunMigration) {
   }
 
   const smartOrKol = candidate.smartMoneyCount + candidate.kolCount;
-  if (smartOrKol < trigger.minSmartOrKolCount) {
-    return `smart/KOL ${smartOrKol} < ${trigger.minSmartOrKolCount}`;
-  }
+  if (smartOrKol < trigger.minSmartOrKolCount) return `smart/KOL ${smartOrKol} < ${trigger.minSmartOrKolCount}`;
 
   const ratio = gmgnBuySellRatio(candidate);
-  if (ratio !== undefined && ratio < trigger.minBuySellRatio) {
-    return `buy/sell ${ratio.toFixed(2)} < ${trigger.minBuySellRatio}`;
-  }
+  if (ratio !== undefined && ratio < trigger.minBuySellRatio) return `buy/sell ${ratio.toFixed(2)} < ${trigger.minBuySellRatio}`;
 
-  candidate.sourceMeta = {
-    ...candidate.sourceMeta,
-    scans,
-    holderGrowthPct,
-    liquidityDropPct,
-    buySellRatio: ratio,
-  };
+  candidate.sourceMeta = { ...candidate.sourceMeta, scans, holderGrowthPct, liquidityDropPct, buySellRatio: ratio };
   candidate.alert.sourceMeta = candidate.sourceMeta;
   candidate.alert.holder_growth_pct = holderGrowthPct;
   candidate.alert.bs_ratio = ratio ?? 0;
   return null;
 }
-
 function reject(candidate: Partial<GmgnSignalCandidate> | null, source: GmgnSourceKind, reason: string): void {
   candidatesFiltered++;
   const row = {
