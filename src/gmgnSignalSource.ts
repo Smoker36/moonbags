@@ -174,6 +174,14 @@ type GmgnSnapshot = {
   rows: Array<Pick<GmgnWatchEntry, "mint" | "name" | "symbol" | "source" | "status" | "reason" | "score" | "marketCapUsd" | "liquidityUsd" | "holders" | "top10Pct" | "rugRatio">>;
 };
 
+type PostMigrationPriceTracker = {
+  postMigrationLowPrice: number;
+  postMigrationLowAt: number;
+  lastObservedPrice: number;
+  firstTrackedAt: number;
+  lastUpdatedAt: number;
+};
+
 type StartOptions = {
   onAcceptedCandidate?: (alert: ScgAlert) => void | Promise<void>;
 };
@@ -213,6 +221,7 @@ const SEEN_CAP = 10_000;
 const WATCHLIST_CAP = 500;
 const SNAPSHOT_CAP = 5_000;
 const RECENT_REJECTION_CAP = 20;
+const POST_MIGRATION_TRACKER_TTL_MS = 6 * 60 * 60 * 1_000;
 
 const DEFAULT_SETTINGS: GmgnSettings = {
   enabled: true,
@@ -294,6 +303,7 @@ const seenSourceOrder: string[] = [];
 const watchlist = new Map<string, GmgnWatchEntry>();
 const snapshots: GmgnSnapshot[] = [];
 const recentRejections: GmgnStatus["recentRejections"] = [];
+const postMigrationTrackers = new Map<string, PostMigrationPriceTracker>();
 
 let running = false;
 let seeded = false;
@@ -610,7 +620,7 @@ function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
     sourceMeta.platform === "Pump.fun" ||
     sourceMeta.platform === "pump_mayhem" ||
     raw.launchpad === "pump" ||
-    raw.platform?.toLowerCase?.().includes("pump");
+    String(raw.platform ?? "").toLowerCase().includes("pump");
 
   if (!isPumpPlatform) {
     return { isMigrated: false, confidence: 0 };
@@ -665,6 +675,40 @@ function detectPostMigrationDump(
     dropPct,
     holderTrend,
   };
+}
+
+function clearExpiredPostMigrationTrackers(now: number): void {
+  for (const [mint, tracker] of postMigrationTrackers.entries()) {
+    if (now - tracker.lastUpdatedAt > POST_MIGRATION_TRACKER_TTL_MS) {
+      postMigrationTrackers.delete(mint);
+    }
+  }
+}
+
+function updatePostMigrationTracker(mint: string, currentPrice: number, now: number): PostMigrationPriceTracker {
+  const existing = postMigrationTrackers.get(mint);
+  if (!existing) {
+    const created: PostMigrationPriceTracker = {
+      postMigrationLowPrice: currentPrice,
+      postMigrationLowAt: now,
+      lastObservedPrice: currentPrice,
+      firstTrackedAt: now,
+      lastUpdatedAt: now,
+    };
+    postMigrationTrackers.set(mint, created);
+    return created;
+  }
+  const nextLowPrice = Math.min(existing.postMigrationLowPrice, currentPrice);
+  const nextLowAt = nextLowPrice < existing.postMigrationLowPrice ? now : existing.postMigrationLowAt;
+  const updated: PostMigrationPriceTracker = {
+    ...existing,
+    postMigrationLowPrice: nextLowPrice,
+    postMigrationLowAt: nextLowAt,
+    lastObservedPrice: currentPrice,
+    lastUpdatedAt: now,
+  };
+  postMigrationTrackers.set(mint, updated);
+  return updated;
 }
 
 /**
@@ -859,55 +903,45 @@ function maybeRejectTrigger(candidate: GmgnSignalCandidate, settings: GmgnSettin
     return `liquidity drop ${liquidityDropPct.toFixed(0)}% > ${trigger.maxLiquidityDropPct}%`;
   }
 
-  // ===== CUSTOM STRATEGY: Post-Migration Dump Detection =====
-  if (
-    settings.filters.requirePumpfunMigration &&
-    settings.filters.minPriceDropPctAfterMigration > 0
-  ) {
-    const migration = detectPumpfunMigration(candidate);
-    if (migration.isMigrated) {
+  // ===== CUSTOM STRATEGY: Post-migration low tracking + dump gating =====
+  clearExpiredPostMigrationTrackers(Date.now());
+  const migration = settings.filters.requirePumpfunMigration ? detectPumpfunMigration(candidate) : { isMigrated: false, confidence: 0 };
+  if (migration.isMigrated) {
+    const currentPrice = Math.max(0, candidate.priceUsd ?? 0);
+    const tracker = updatePostMigrationTracker(candidate.mint, currentPrice, Date.now());
+    const distanceFromLowPct = tracker.postMigrationLowPrice > 0
+      ? ((tracker.lastObservedPrice - tracker.postMigrationLowPrice) / tracker.postMigrationLowPrice) * 100
+      : 0;
+    candidate.sourceMeta = {
+      ...candidate.sourceMeta,
+      postMigrationLowPrice: tracker.postMigrationLowPrice,
+      postMigrationLowAt: tracker.postMigrationLowAt,
+      lastObservedPrice: tracker.lastObservedPrice,
+      bottomDetection: {
+        isAtBottom: tracker.lastObservedPrice <= tracker.postMigrationLowPrice,
+        lowPrice: tracker.postMigrationLowPrice,
+        distanceFromLowPct: Math.round(distanceFromLowPct * 100) / 100,
+      },
+    };
+    logger.info(
+      {
+        mint: candidate.mint,
+        current: tracker.lastObservedPrice,
+        low: tracker.postMigrationLowPrice,
+        distanceFromLowPct: Math.round(distanceFromLowPct * 100) / 100,
+      },
+      "[gmgn-source] post-migration bottom tracker",
+    );
+
+    if (settings.filters.minPriceDropPctAfterMigration > 0) {
       const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
       const dump = detectPostMigrationDump(candidate, {
         priceUsd: firstPrice,
         holders: firstHolders,
       });
-
       if (dump.dropPct >= settings.filters.minPriceDropPctAfterMigration) {
         candidate.sourceMeta = {
-          ...candidate.sourc// ===== CUSTOM STRATEGY: Dump to Bottom Detection =====
-if (settings.filters.requirePumpfunMigration) {
-  const migration = detectPumpfunMigration(candidate);
-  if (migration.isMigrated) {
-    // Track lowest price since migration
-    const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
-    const currentPrice = candidate.priceUsd ?? 0;
-    const lowestPrice = existing?.sourceMeta?.lowestPrice ?? firstPrice;
-    
-    // Update lowest price if current is lower
-    const newLowestPrice = Math.min(lowestPrice, currentPrice);
-    
-    // Check if price is at bottom (below lowest by small margin, then starting to recover)
-    const maxDropPct = ((firstPrice - newLowestPrice) / firstPrice) * 100;
-    const isRecovering = currentPrice > newLowestPrice * 1.02; // 2% above lowest = sign of recovery
-    const isAtBottom = newLowestPrice > 0 && maxDropPct > 10 && isRecovering; // Min 10% dump + signs of recovery
-    
-    if (isAtBottom) {
-      candidate.sourceMeta = {
-        ...candidate.sourceMeta,
-        bottomDetection: {
-          isAtBottom: true,
-          currentPrice,
-          lowestPrice: newLowestPrice,
-          maxDropPct: Math.round(maxDropPct * 100) / 100,
-          isRecovering,
-        },
-      };
-    } else {
-      // Still dumping or waiting for recovery
-      return `dumping to bottom... current: $${currentPrice.toFixed(6)}, lowest: $${newLowestPrice.toFixed(6)}, drop: ${maxDropPct.toFixed(1)}%`;
-    }
-  }
-}eMeta,
+          ...candidate.sourceMeta,
           dumpDetection: {
             isDumping: dump.isDumping,
             dropPct: dump.dropPct,
@@ -1662,6 +1696,7 @@ async function processSeed(seed: GmgnSignalCandidate, settings: GmgnSettings): P
 
   candidatesAccepted++;
   const alert = enriched.alert;
+  postMigrationTrackers.delete(enriched.mint);
   markSignalMintAccepted(enriched.mint, "gmgn");
   recordAlertEvent({
     at: Date.now(),
