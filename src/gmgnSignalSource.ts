@@ -86,6 +86,11 @@ type GmgnSettings = {
     requirePumpfunMigration: boolean;
     minPriceDropPctAfterMigration: number;
     minRsiForDump: number;
+    recoveryMinReboundPct: number;
+    recoveryLookbackScans: number;
+    recoveryMinHigherLows: number;
+    recoveryMinBuySellRatio: number;
+    recoveryRequirePositiveNetFlow: boolean;
   };
   trigger: {
     minScans: number;
@@ -136,6 +141,8 @@ export type GmgnSignalCandidate = {
   renouncedFreeze: boolean;
   isOnCurve: boolean;
   sourceMeta: Record<string, unknown>;
+  recoveryConfirmedAt?: number;
+  recoveryReason?: string;
   raw: GmgnRow;
   alert: ScgAlert;
 };
@@ -163,6 +170,8 @@ type GmgnWatchEntry = {
   top10Pct: number;
   rugRatio: number;
   sourceMeta: Record<string, unknown>;
+  recoveryConfirmedAt?: number;
+  recoveryReason?: string;
 };
 
 type GmgnSnapshot = {
@@ -273,6 +282,11 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     requirePumpfunMigration: true,
     minPriceDropPctAfterMigration: 15,
     minRsiForDump: 0,
+    recoveryMinReboundPct: 2,
+    recoveryLookbackScans: 4,
+    recoveryMinHigherLows: 2,
+    recoveryMinBuySellRatio: 1.1,
+    recoveryRequirePositiveNetFlow: true,
   },
   trigger: {
     minScans: 10,
@@ -439,6 +453,14 @@ function currentSettings(): GmgnSettings {
       requirePumpfunMigration: filters.requirePumpfunMigration === undefined ? DEFAULT_SETTINGS.filters.requirePumpfunMigration : Boolean(filters.requirePumpfunMigration),
       minPriceDropPctAfterMigration: Math.max(0, finite(filters.minPriceDropPctAfterMigration, DEFAULT_SETTINGS.filters.minPriceDropPctAfterMigration)),
       minRsiForDump: Math.max(0, Math.min(100, finite(filters.minRsiForDump, DEFAULT_SETTINGS.filters.minRsiForDump))),
+      recoveryMinReboundPct: Math.max(0, finite(filters.recoveryMinReboundPct, DEFAULT_SETTINGS.filters.recoveryMinReboundPct)),
+      recoveryLookbackScans: Math.max(2, Math.min(10, Math.round(finite(filters.recoveryLookbackScans, DEFAULT_SETTINGS.filters.recoveryLookbackScans)))),
+      recoveryMinHigherLows: Math.max(1, Math.min(5, Math.round(finite(filters.recoveryMinHigherLows, DEFAULT_SETTINGS.filters.recoveryMinHigherLows)))),
+      recoveryMinBuySellRatio: Math.max(0, finite(filters.recoveryMinBuySellRatio, DEFAULT_SETTINGS.filters.recoveryMinBuySellRatio)),
+      recoveryRequirePositiveNetFlow:
+        filters.recoveryRequirePositiveNetFlow === undefined
+          ? DEFAULT_SETTINGS.filters.recoveryRequirePositiveNetFlow
+          : Boolean(filters.recoveryRequirePositiveNetFlow),
     },
     trigger: {
       minScans: Math.max(1, Math.min(20, Math.round(finite(trigger.minScans, DEFAULT_SETTINGS.trigger.minScans)))),
@@ -610,7 +632,7 @@ function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
     sourceMeta.platform === "Pump.fun" ||
     sourceMeta.platform === "pump_mayhem" ||
     raw.launchpad === "pump" ||
-    raw.platform?.toLowerCase?.().includes("pump");
+    String(raw.platform ?? "").toLowerCase().includes("pump");
 
   if (!isPumpPlatform) {
     return { isMigrated: false, confidence: 0 };
@@ -836,6 +858,52 @@ function gmgnSnapshotCount(mint: string): number {
   }, 0);
 }
 
+function evaluateRecovery(
+  candidate: GmgnSignalCandidate,
+  existing: GmgnWatchEntry | undefined,
+  settings: GmgnSettings
+): { ok: boolean; reason: string; confirmedAt?: number; postMigrationLowPrice: number } {
+  const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
+  const currentPrice = candidate.priceUsd ?? 0;
+  const priorLow = getMaybeNumber(existing?.sourceMeta?.postMigrationLowPrice) ?? firstPrice;
+  const postMigrationLowPrice = priorLow > 0 ? Math.min(priorLow, currentPrice) : currentPrice;
+  const reboundPct = postMigrationLowPrice > 0 ? ((currentPrice - postMigrationLowPrice) / postMigrationLowPrice) * 100 : 0;
+  const minReboundPct = settings.filters.recoveryMinReboundPct;
+  if (reboundPct < minReboundPct) {
+    return { ok: false, reason: "recovery_not_confirmed", postMigrationLowPrice };
+  }
+
+  const historyRaw = Array.isArray(existing?.sourceMeta?.recentScans) ? existing?.sourceMeta?.recentScans : [];
+  const recentScans = [...historyRaw, { priceUsd: currentPrice }].slice(-settings.filters.recoveryLookbackScans);
+  let higherLows = 0;
+  for (let i = 1; i < recentScans.length; i++) {
+    const prev = getMaybeNumber((recentScans[i - 1] as Record<string, unknown>).priceUsd) ?? 0;
+    const curr = getMaybeNumber((recentScans[i] as Record<string, unknown>).priceUsd) ?? 0;
+    if (prev > 0 && curr > prev) higherLows++;
+  }
+  if (higherLows < settings.filters.recoveryMinHigherLows) {
+    return { ok: false, reason: "recovery_not_confirmed", postMigrationLowPrice };
+  }
+
+  const ratio = gmgnBuySellRatio(candidate) ?? 0;
+  const buyCount = getMaybeNumber(candidate.sourceMeta?.buy_count) ?? getMaybeNumber(candidate.sourceMeta?.buyCount) ?? 0;
+  const sellCount = getMaybeNumber(candidate.sourceMeta?.sell_count) ?? getMaybeNumber(candidate.sourceMeta?.sellCount) ?? 0;
+  const netFlow = buyCount - sellCount;
+  if (ratio < settings.filters.recoveryMinBuySellRatio) {
+    return { ok: false, reason: "recovery_not_confirmed", postMigrationLowPrice };
+  }
+  if (settings.filters.recoveryRequirePositiveNetFlow && netFlow <= 0) {
+    return { ok: false, reason: "recovery_not_confirmed", postMigrationLowPrice };
+  }
+
+  return {
+    ok: true,
+    reason: `rebound ${reboundPct.toFixed(1)}%, higher-lows ${higherLows}/${recentScans.length - 1}, buy/sell ${ratio.toFixed(2)}, netFlow ${netFlow}`,
+    confirmedAt: existing?.recoveryConfirmedAt ?? Date.now(),
+    postMigrationLowPrice,
+  };
+}
+
 function maybeRejectTrigger(candidate: GmgnSignalCandidate, settings: GmgnSettings): string | null {
   const trigger = settings.trigger;
   const existing = watchlist.get(candidate.mint);
@@ -859,65 +927,35 @@ function maybeRejectTrigger(candidate: GmgnSignalCandidate, settings: GmgnSettin
     return `liquidity drop ${liquidityDropPct.toFixed(0)}% > ${trigger.maxLiquidityDropPct}%`;
   }
 
-  // ===== CUSTOM STRATEGY: Post-Migration Dump Detection =====
-  if (
-    settings.filters.requirePumpfunMigration &&
-    settings.filters.minPriceDropPctAfterMigration > 0
-  ) {
+  if (settings.filters.requirePumpfunMigration) {
     const migration = detectPumpfunMigration(candidate);
-    if (migration.isMigrated) {
-      const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
-      const dump = detectPostMigrationDump(candidate, {
-        priceUsd: firstPrice,
-        holders: firstHolders,
-      });
-
-      if (dump.dropPct >= settings.filters.minPriceDropPctAfterMigration) {
-        candidate.sourceMeta = {
-          ...candidate.sourc// ===== CUSTOM STRATEGY: Dump to Bottom Detection =====
-if (settings.filters.requirePumpfunMigration) {
-  const migration = detectPumpfunMigration(candidate);
-  if (migration.isMigrated) {
-    // Track lowest price since migration
+    if (!migration.isMigrated) return "not migrated from pumpfun";
     const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
-    const currentPrice = candidate.priceUsd ?? 0;
-    const lowestPrice = existing?.sourceMeta?.lowestPrice ?? firstPrice;
-    
-    // Update lowest price if current is lower
-    const newLowestPrice = Math.min(lowestPrice, currentPrice);
-    
-    // Check if price is at bottom (below lowest by small margin, then starting to recover)
-    const maxDropPct = ((firstPrice - newLowestPrice) / firstPrice) * 100;
-    const isRecovering = currentPrice > newLowestPrice * 1.02; // 2% above lowest = sign of recovery
-    const isAtBottom = newLowestPrice > 0 && maxDropPct > 10 && isRecovering; // Min 10% dump + signs of recovery
-    
-    if (isAtBottom) {
-      candidate.sourceMeta = {
-        ...candidate.sourceMeta,
-        bottomDetection: {
-          isAtBottom: true,
-          currentPrice,
-          lowestPrice: newLowestPrice,
-          maxDropPct: Math.round(maxDropPct * 100) / 100,
-          isRecovering,
-        },
-      };
-    } else {
-      // Still dumping or waiting for recovery
-      return `dumping to bottom... current: $${currentPrice.toFixed(6)}, lowest: $${newLowestPrice.toFixed(6)}, drop: ${maxDropPct.toFixed(1)}%`;
+    const dump = detectPostMigrationDump(candidate, { priceUsd: firstPrice, holders: firstHolders });
+    if (dump.dropPct < settings.filters.minPriceDropPctAfterMigration) {
+      return `post-migration drop ${dump.dropPct.toFixed(1)}% < ${settings.filters.minPriceDropPctAfterMigration}%`;
     }
-  }
-}eMeta,
-          dumpDetection: {
-            isDumping: dump.isDumping,
-            dropPct: dump.dropPct,
-            holderTrend: dump.holderTrend,
-          },
-        };
-      } else {
-        return `post-migration drop ${dump.dropPct.toFixed(1)}% < ${settings.filters.minPriceDropPctAfterMigration}%`;
-      }
+    const trackedLow = Math.min(
+      getMaybeNumber(existing?.sourceMeta?.postMigrationLowPrice) ?? firstPrice,
+      candidate.priceUsd,
+    );
+    if (!(trackedLow > 0 && trackedLow < firstPrice)) {
+      return "recovery_not_confirmed";
     }
+    const recovery = evaluateRecovery(candidate, existing, settings);
+    candidate.recoveryConfirmedAt = recovery.confirmedAt;
+    candidate.recoveryReason = recovery.ok ? recovery.reason : undefined;
+    if (!recovery.ok) return "recovery_not_confirmed";
+    candidate.sourceMeta = {
+      ...candidate.sourceMeta,
+      postMigrationLowPrice: recovery.postMigrationLowPrice,
+      recoveryConfirmedAt: recovery.confirmedAt,
+      recoveryReason: recovery.reason,
+      recentScans: [
+        ...(Array.isArray(existing?.sourceMeta?.recentScans) ? existing?.sourceMeta?.recentScans : []),
+        { at: Date.now(), priceUsd: candidate.priceUsd },
+      ].slice(-settings.filters.recoveryLookbackScans),
+    };
   }
 
   const smartOrKol = candidate.smartMoneyCount + candidate.kolCount;
@@ -1012,6 +1050,8 @@ function upsertWatchEntry(
     top10Pct: candidate.top10Pct,
     rugRatio: candidate.rugRatio,
     sourceMeta: candidate.sourceMeta,
+    recoveryConfirmedAt: candidate.recoveryConfirmedAt ?? existing?.recoveryConfirmedAt,
+    recoveryReason: candidate.recoveryReason ?? existing?.recoveryReason,
   };
   if (existing) {
     watchlist.set(candidate.mint, { ...existing, ...entry, firstSeenAt: existing.firstSeenAt ?? Date.now() });
@@ -1092,6 +1132,8 @@ function hydrateWatchEntry(raw: unknown): GmgnWatchEntry | null {
     top10Pct: Number(rec.top10Pct ?? 0) || 0,
     rugRatio: Number(rec.rugRatio ?? 0) || 0,
     sourceMeta: (rec.sourceMeta && typeof rec.sourceMeta === "object" ? rec.sourceMeta : {}) as Record<string, unknown>,
+    recoveryConfirmedAt: Number(rec.recoveryConfirmedAt ?? 0) || undefined,
+    recoveryReason: getMaybeString(rec.recoveryReason),
   };
 }
 
