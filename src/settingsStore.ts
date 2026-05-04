@@ -141,6 +141,12 @@ export type RuntimeSettings = {
     minOrganicVolumePct: number;
     minOrganicBuyersPct: number;
   };
+  gmgnStrategy: {
+    dynamicFeeGate: {
+      enabled: boolean;
+      mode: "marketcap_div_5";
+    };
+  };
 };
 
 export const EXIT_STRATEGY_LABELS: Record<ExitStrategyMode, string> = {
@@ -300,6 +306,12 @@ function defaultSettings(): RuntimeSettings {
       minOrganicVolumePct: 0,
       minOrganicBuyersPct: 0,
     },
+    gmgnStrategy: {
+      dynamicFeeGate: {
+        enabled: false,
+        mode: "marketcap_div_5",
+      },
+    },
   };
 }
 
@@ -384,6 +396,10 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
   const marketData = (root.marketData && typeof root.marketData === "object" ? root.marketData : {}) as Record<string, unknown>;
   const wss = (marketData.wss && typeof marketData.wss === "object" ? marketData.wss : {}) as Record<string, unknown>;
   const jupGate = (root.jupGate && typeof root.jupGate === "object" ? root.jupGate : {}) as Record<string, unknown>;
+  const gmgnStrategy = (root.gmgnStrategy && typeof root.gmgnStrategy === "object" ? root.gmgnStrategy : {}) as Record<string, unknown>;
+  const dynamicFeeGate = (gmgnStrategy.dynamicFeeGate && typeof gmgnStrategy.dynamicFeeGate === "object"
+    ? gmgnStrategy.dynamicFeeGate
+    : {}) as Record<string, unknown>;
 
   const rawType = profit.type;
   const type: ExitStrategyMode =
@@ -531,6 +547,12 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
       allowedScoreLabels: normalizeStringList(jupGate.allowedScoreLabels, defaults.jupGate.allowedScoreLabels, true),
       minOrganicVolumePct: num(jupGate.minOrganicVolumePct, defaults.jupGate.minOrganicVolumePct, 0, 100),
       minOrganicBuyersPct: num(jupGate.minOrganicBuyersPct, defaults.jupGate.minOrganicBuyersPct, 0, 100),
+    },
+    gmgnStrategy: {
+      dynamicFeeGate: {
+        enabled: bool(dynamicFeeGate.enabled, defaults.gmgnStrategy.dynamicFeeGate.enabled),
+        mode: dynamicFeeGate.mode === "marketcap_div_5" ? "marketcap_div_5" : defaults.gmgnStrategy.dynamicFeeGate.mode,
+      },
     },
   };
 }
