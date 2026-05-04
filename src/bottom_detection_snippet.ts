@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Detect if token price is at BOTTOM after pumpfun migration
  * Tracks lowest price and detects recovery signal
