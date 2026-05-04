@@ -203,9 +203,7 @@ function AlertItem({ a, closed, info }: { a: Alert; closed?: ClosedTrade; info?:
                 {info.organicScoreLabel}
               </span>
             )}
-            {volumeRatioLabel && (
-              <span className="px-1 bg-surface-container-highest text-[8px] font-mono text-coral uppercase">
-                {volumeRatioLabel}
+
               </span>
             )}
           </div>

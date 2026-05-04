@@ -142,6 +142,9 @@ export type GmgnSignalCandidate = {
   renouncedMint: boolean;
   renouncedFreeze: boolean;
   isOnCurve: boolean;
+  migrationDetected: boolean;
+  migrationSource?: string;
+  migrationTimestamp?: number;
   sourceMeta: Record<string, unknown>;
   recoveryConfirmedAt?: number;
   recoveryReason?: string;
@@ -640,6 +643,7 @@ function buildAlert(candidate: GmgnSignalCandidate): ScgAlert {
 function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
   isMigrated: boolean;
   confidence: number;
+  source?: string;
   migrationTime?: number;
 } {
   const sourceMeta = candidate.sourceMeta ?? {};
@@ -647,12 +651,16 @@ function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
   const rawPlatform = typeof raw.platform === "string" ? raw.platform.toLowerCase() : "";
 
   // Check pumpfun platform indicators
+  const platformRaw =
+    getMaybeString(sourceMeta.platform) ??
+    getMaybeString(raw.platform) ??
+    getMaybeString(raw.launchpad) ??
+    getMaybeString(raw.launchpad_platform);
+  const platform = platformRaw?.trim().toLowerCase() ?? "";
+  const normalizedSource =
+    platform === "pump.fun" || platform === "pumpfun" || platform === "pump" ? "pump.fun" : platform || undefined;
   const isPumpPlatform =
     candidate.source === "trenches" ||
-    sourceMeta.platform === "Pump.fun" ||
-    sourceMeta.platform === "pump_mayhem" ||
-    raw.launchpad === "pump" ||
-
 
   if (!isPumpPlatform) {
     return { isMigrated: false, confidence: 0 };
@@ -675,6 +683,7 @@ function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
   return {
     isMigrated: confidence >= 50,
     confidence,
+    source: normalizedSource,
     migrationTime: candidate.timestamp,
   };
 }
@@ -877,9 +886,13 @@ function maybeReject(candidate: Partial<GmgnSignalCandidate>, _reason: string): 
   // ===== CUSTOM STRATEGY: Pumpfun Migration Detection =====
   if (filters.requirePumpfunMigration) {
     const migration = detectPumpfunMigration(candidate);
-    if (!migration.isMigrated) {
-      return `not migrated from pumpfun (confidence ${migration.confidence}%)`;
-    }
+    if (!migration.isMigrated) return "not_migrated";
+    const allowed = getRuntimeSettings().signals.gmgn.allowedMigrationSources.map((x) => x.toLowerCase());
+    const source = (migration.source ?? "").toLowerCase();
+    if (!source || !allowed.includes(source)) return "migration_source_not_allowed";
+    candidate.migrationDetected = true;
+    candidate.migrationSource = migration.source;
+    candidate.migrationTimestamp = migration.migrationTime;
     // Store migration data for later use
     candidate.sourceMeta = {
       ...candidate.sourceMeta,
@@ -1352,6 +1365,9 @@ function baseSeedFromRow(source: GmgnSourceKind, chain: GmgnChain, row: GmgnRow)
     renouncedMint,
     renouncedFreeze,
     isOnCurve,
+    migrationDetected: false,
+    migrationSource: undefined,
+    migrationTimestamp: undefined,
     sourceMeta: {
       source,
       chain,
@@ -1564,6 +1580,9 @@ async function fetchSeeds(settings: GmgnSettings): Promise<GmgnSignalCandidate[]
             renouncedMint: Boolean(meta.renouncedMint ?? false),
             renouncedFreeze: Boolean(meta.renouncedFreeze ?? false),
             isOnCurve: Boolean(meta.isOnCurve ?? false),
+            migrationDetected: Boolean(meta.migrationDetected ?? false),
+            migrationSource: typeof meta.migrationSource === "string" ? meta.migrationSource : undefined,
+            migrationTimestamp: typeof meta.migrationTimestamp === "number" ? meta.migrationTimestamp : undefined,
             sourceMeta: { ...meta, source: "watchlist" },
             raw: cloneRawRow(raw),
             alert: {} as ScgAlert,
