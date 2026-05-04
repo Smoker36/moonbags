@@ -193,6 +193,11 @@ function AlertItem({ a, closed, info }: { a: Alert; closed?: ClosedTrade; info?:
                 {info.organicScoreLabel}
               </span>
             )}
+            {(info?.migrationSource || (a.sourceMeta?.migrationSource as string | undefined)) && (
+              <span className="px-1 bg-surface-container-highest text-[8px] font-mono text-muted-foreground uppercase">
+                MIG {(info?.migrationSource || String(a.sourceMeta?.migrationSource)).toLowerCase()}
+              </span>
+            )}
           </div>
         </div>
       </div>

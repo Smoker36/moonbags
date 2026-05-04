@@ -146,6 +146,11 @@ export function TokenInfoBadges({ info, compact = false }: { info: TokenInfo; co
           </TooltipContent>
         </Tooltip>
       )}
+      {info.migrationDetected && info.migrationSource && (
+        <Badge variant="muted" className="font-mono uppercase">
+          MIG {info.migrationSource}
+        </Badge>
+      )}
 
       {/* Compact mode hides the longer info row */}
       {!compact && (

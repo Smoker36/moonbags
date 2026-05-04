@@ -122,6 +122,7 @@ export type RuntimeSettings = {
         minBuySellRatio: number;
         minSmartOrKolCount: number;
       };
+      allowedMigrationSources: string[];
     };
   };
   marketData: {
@@ -283,6 +284,7 @@ function defaultSettings(): RuntimeSettings {
           minBuySellRatio: 1.15,
           minSmartOrKolCount: 0,
         },
+        allowedMigrationSources: ["pump.fun", "pump_mayhem", "letsbonk"],
       },
     },
     marketData: {
@@ -515,6 +517,10 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
           minBuySellRatio: num(gmgnTrigger.minBuySellRatio, defaults.signals.gmgn.trigger.minBuySellRatio, 0, 1000),
           minSmartOrKolCount: Math.round(num(gmgnTrigger.minSmartOrKolCount, defaults.signals.gmgn.trigger.minSmartOrKolCount, 0, 1000)),
         },
+        allowedMigrationSources: normalizeStringList(
+          gmgnSignals.allowedMigrationSources,
+          defaults.signals.gmgn.allowedMigrationSources,
+        ).map((source) => source.toLowerCase()),
       },
     },
     marketData: {

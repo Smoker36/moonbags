@@ -36,6 +36,7 @@ export type Alert = {
   liquidity: number;
   action: "fired" | "filtered" | "dedup";
   reason?: string;
+  sourceMeta?: Record<string, unknown>;
 };
 
 export type TokenInfo = {
@@ -66,6 +67,9 @@ export type TokenInfo = {
   tags: string[];
   launchpad: string;
   icon: string;
+  migrationDetected?: boolean;
+  migrationSource?: string;
+  migrationTimestamp?: number;
   fetchedAt: number;
 };
 

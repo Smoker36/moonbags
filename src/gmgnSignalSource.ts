@@ -135,6 +135,9 @@ export type GmgnSignalCandidate = {
   renouncedMint: boolean;
   renouncedFreeze: boolean;
   isOnCurve: boolean;
+  migrationDetected: boolean;
+  migrationSource?: string;
+  migrationTimestamp?: number;
   sourceMeta: Record<string, unknown>;
   raw: GmgnRow;
   alert: ScgAlert;
@@ -599,18 +602,26 @@ function buildAlert(candidate: GmgnSignalCandidate): ScgAlert {
 function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
   isMigrated: boolean;
   confidence: number;
+  source?: string;
   migrationTime?: number;
 } {
   const sourceMeta = candidate.sourceMeta ?? {};
   const raw = candidate.raw ?? {};
 
   // Check pumpfun platform indicators
+  const platformRaw =
+    getMaybeString(sourceMeta.platform) ??
+    getMaybeString(raw.platform) ??
+    getMaybeString(raw.launchpad) ??
+    getMaybeString(raw.launchpad_platform);
+  const platform = platformRaw?.trim().toLowerCase() ?? "";
+  const normalizedSource =
+    platform === "pump.fun" || platform === "pumpfun" || platform === "pump" ? "pump.fun" : platform || undefined;
   const isPumpPlatform =
     candidate.source === "trenches" ||
-    sourceMeta.platform === "Pump.fun" ||
-    sourceMeta.platform === "pump_mayhem" ||
-    raw.launchpad === "pump" ||
-    raw.platform?.toLowerCase?.().includes("pump");
+    normalizedSource === "pump.fun" ||
+    normalizedSource === "pump_mayhem" ||
+    normalizedSource === "letsbonk";
 
   if (!isPumpPlatform) {
     return { isMigrated: false, confidence: 0 };
@@ -633,6 +644,7 @@ function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
   return {
     isMigrated: confidence >= 50,
     confidence,
+    source: normalizedSource,
     migrationTime: candidate.timestamp,
   };
 }
@@ -780,9 +792,13 @@ function maybeReject(candidate: Partial<GmgnSignalCandidate>, _reason: string): 
   // ===== CUSTOM STRATEGY: Pumpfun Migration Detection =====
   if (filters.requirePumpfunMigration) {
     const migration = detectPumpfunMigration(candidate);
-    if (!migration.isMigrated) {
-      return `not migrated from pumpfun (confidence ${migration.confidence}%)`;
-    }
+    if (!migration.isMigrated) return "not_migrated";
+    const allowed = getRuntimeSettings().signals.gmgn.allowedMigrationSources.map((x) => x.toLowerCase());
+    const source = (migration.source ?? "").toLowerCase();
+    if (!source || !allowed.includes(source)) return "migration_source_not_allowed";
+    candidate.migrationDetected = true;
+    candidate.migrationSource = migration.source;
+    candidate.migrationTimestamp = migration.migrationTime;
     // Store migration data for later use
     candidate.sourceMeta = {
       ...candidate.sourceMeta,
@@ -859,64 +875,11 @@ function maybeRejectTrigger(candidate: GmgnSignalCandidate, settings: GmgnSettin
     return `liquidity drop ${liquidityDropPct.toFixed(0)}% > ${trigger.maxLiquidityDropPct}%`;
   }
 
-  // ===== CUSTOM STRATEGY: Post-Migration Dump Detection =====
-  if (
-    settings.filters.requirePumpfunMigration &&
-    settings.filters.minPriceDropPctAfterMigration > 0
-  ) {
-    const migration = detectPumpfunMigration(candidate);
-    if (migration.isMigrated) {
-      const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
-      const dump = detectPostMigrationDump(candidate, {
-        priceUsd: firstPrice,
-        holders: firstHolders,
-      });
-
-      if (dump.dropPct >= settings.filters.minPriceDropPctAfterMigration) {
-        candidate.sourceMeta = {
-          ...candidate.sourc// ===== CUSTOM STRATEGY: Dump to Bottom Detection =====
-if (settings.filters.requirePumpfunMigration) {
-  const migration = detectPumpfunMigration(candidate);
-  if (migration.isMigrated) {
-    // Track lowest price since migration
-    const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
-    const currentPrice = candidate.priceUsd ?? 0;
-    const lowestPrice = existing?.sourceMeta?.lowestPrice ?? firstPrice;
-    
-    // Update lowest price if current is lower
-    const newLowestPrice = Math.min(lowestPrice, currentPrice);
-    
-    // Check if price is at bottom (below lowest by small margin, then starting to recover)
-    const maxDropPct = ((firstPrice - newLowestPrice) / firstPrice) * 100;
-    const isRecovering = currentPrice > newLowestPrice * 1.02; // 2% above lowest = sign of recovery
-    const isAtBottom = newLowestPrice > 0 && maxDropPct > 10 && isRecovering; // Min 10% dump + signs of recovery
-    
-    if (isAtBottom) {
-      candidate.sourceMeta = {
-        ...candidate.sourceMeta,
-        bottomDetection: {
-          isAtBottom: true,
-          currentPrice,
-          lowestPrice: newLowestPrice,
-          maxDropPct: Math.round(maxDropPct * 100) / 100,
-          isRecovering,
-        },
-      };
-    } else {
-      // Still dumping or waiting for recovery
-      return `dumping to bottom... current: $${currentPrice.toFixed(6)}, lowest: $${newLowestPrice.toFixed(6)}, drop: ${maxDropPct.toFixed(1)}%`;
-    }
-  }
-}eMeta,
-          dumpDetection: {
-            isDumping: dump.isDumping,
-            dropPct: dump.dropPct,
-            holderTrend: dump.holderTrend,
-          },
-        };
-      } else {
-        return `post-migration drop ${dump.dropPct.toFixed(1)}% < ${settings.filters.minPriceDropPctAfterMigration}%`;
-      }
+  if (settings.filters.requirePumpfunMigration) {
+    if (!candidate.migrationDetected) return "not_migrated";
+    const allowed = getRuntimeSettings().signals.gmgn.allowedMigrationSources.map((x) => x.toLowerCase());
+    if (!candidate.migrationSource || !allowed.includes(candidate.migrationSource.toLowerCase())) {
+      return "migration_source_not_allowed";
     }
   }
 
@@ -1256,6 +1219,9 @@ function baseSeedFromRow(source: GmgnSourceKind, chain: GmgnChain, row: GmgnRow)
     renouncedMint,
     renouncedFreeze,
     isOnCurve,
+    migrationDetected: false,
+    migrationSource: undefined,
+    migrationTimestamp: undefined,
     sourceMeta: {
       source,
       chain,
@@ -1468,6 +1434,9 @@ async function fetchSeeds(settings: GmgnSettings): Promise<GmgnSignalCandidate[]
             renouncedMint: Boolean(meta.renouncedMint ?? false),
             renouncedFreeze: Boolean(meta.renouncedFreeze ?? false),
             isOnCurve: Boolean(meta.isOnCurve ?? false),
+            migrationDetected: Boolean(meta.migrationDetected ?? false),
+            migrationSource: typeof meta.migrationSource === "string" ? meta.migrationSource : undefined,
+            migrationTimestamp: typeof meta.migrationTimestamp === "number" ? meta.migrationTimestamp : undefined,
             sourceMeta: { ...meta, source: "watchlist" },
             raw: cloneRawRow(raw),
             alert: {} as ScgAlert,
