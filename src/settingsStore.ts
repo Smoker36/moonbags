@@ -113,6 +113,8 @@ export type RuntimeSettings = {
         maxBotRate: number;
         maxCreatorBalanceRate: number;
         requireNotWashTrading: boolean;
+        minVolumeToMcapRatio: number;
+        volumeToMcapWindow: "5m" | "1h" | "24h";
       };
       trigger: {
         minScans: number;
@@ -140,6 +142,12 @@ export type RuntimeSettings = {
     allowedScoreLabels: string[];
     minOrganicVolumePct: number;
     minOrganicBuyersPct: number;
+  };
+  gmgnStrategy: {
+    dynamicFeeGate: {
+      enabled: boolean;
+      mode: "marketcap_div_5";
+    };
   };
 };
 
@@ -274,6 +282,8 @@ function defaultSettings(): RuntimeSettings {
           maxBotRate: 0.45,
           maxCreatorBalanceRate: 0.2,
           requireNotWashTrading: true,
+          minVolumeToMcapRatio: 10,
+          volumeToMcapWindow: "24h",
         },
         trigger: {
           minScans: 10,
@@ -299,6 +309,12 @@ function defaultSettings(): RuntimeSettings {
       allowedScoreLabels: ["medium", "high"],
       minOrganicVolumePct: 0,
       minOrganicBuyersPct: 0,
+    },
+    gmgnStrategy: {
+      dynamicFeeGate: {
+        enabled: false,
+        mode: "marketcap_div_5",
+      },
     },
   };
 }
@@ -384,6 +400,10 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
   const marketData = (root.marketData && typeof root.marketData === "object" ? root.marketData : {}) as Record<string, unknown>;
   const wss = (marketData.wss && typeof marketData.wss === "object" ? marketData.wss : {}) as Record<string, unknown>;
   const jupGate = (root.jupGate && typeof root.jupGate === "object" ? root.jupGate : {}) as Record<string, unknown>;
+  const gmgnStrategy = (root.gmgnStrategy && typeof root.gmgnStrategy === "object" ? root.gmgnStrategy : {}) as Record<string, unknown>;
+  const dynamicFeeGate = (gmgnStrategy.dynamicFeeGate && typeof gmgnStrategy.dynamicFeeGate === "object"
+    ? gmgnStrategy.dynamicFeeGate
+    : {}) as Record<string, unknown>;
 
   const rawType = profit.type;
   const type: ExitStrategyMode =
@@ -506,6 +526,11 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
           maxBotRate: num(gmgnBaseline.maxBotRate, defaults.signals.gmgn.baseline.maxBotRate, 0, 1),
           maxCreatorBalanceRate: num(gmgnBaseline.maxCreatorBalanceRate, defaults.signals.gmgn.baseline.maxCreatorBalanceRate, 0, 1),
           requireNotWashTrading: bool(gmgnBaseline.requireNotWashTrading, defaults.signals.gmgn.baseline.requireNotWashTrading),
+          minVolumeToMcapRatio: num(gmgnBaseline.minVolumeToMcapRatio, defaults.signals.gmgn.baseline.minVolumeToMcapRatio, 0, 10_000),
+          volumeToMcapWindow:
+            gmgnBaseline.volumeToMcapWindow === "5m" || gmgnBaseline.volumeToMcapWindow === "1h" || gmgnBaseline.volumeToMcapWindow === "24h"
+              ? gmgnBaseline.volumeToMcapWindow
+              : defaults.signals.gmgn.baseline.volumeToMcapWindow,
         },
         trigger: {
           minScans: Math.round(num(gmgnTrigger.minScans, defaults.signals.gmgn.trigger.minScans, 1, 20)),
@@ -531,6 +556,12 @@ function normalizeSettings(raw: unknown): RuntimeSettings {
       allowedScoreLabels: normalizeStringList(jupGate.allowedScoreLabels, defaults.jupGate.allowedScoreLabels, true),
       minOrganicVolumePct: num(jupGate.minOrganicVolumePct, defaults.jupGate.minOrganicVolumePct, 0, 100),
       minOrganicBuyersPct: num(jupGate.minOrganicBuyersPct, defaults.jupGate.minOrganicBuyersPct, 0, 100),
+    },
+    gmgnStrategy: {
+      dynamicFeeGate: {
+        enabled: bool(dynamicFeeGate.enabled, defaults.gmgnStrategy.dynamicFeeGate.enabled),
+        mode: dynamicFeeGate.mode === "marketcap_div_5" ? "marketcap_div_5" : defaults.gmgnStrategy.dynamicFeeGate.mode,
+      },
     },
   };
 }

@@ -647,6 +647,8 @@ The OKX live-buy filter is intentionally separate from exit settings. OKX entrie
 
 GMGN uses a scanner/watchlist flow. Each scan pulls GMGN trending, Trenches, and signal data, applies a fast baseline filter, then tracks surviving mints across multiple scans. Defaults live in `state/settings.json`: holders at least 200, liquidity at least $10k, top-10 holders at most 50%, rug/bundler/bot rates capped, creator hold capped, wash trading rejected, then at least two scans with holder growth, stable liquidity, buy pressure, and smart/KOL confirmation. GMGN Watch is the safest first rollout because it records forward snapshots before allowing live buys.
 
+Optional dynamic GMGN fee gate: enable `gmgnStrategy.dynamicFeeGate.enabled` and set `gmgnStrategy.dynamicFeeGate.mode=marketcap_div_5` to require `candidate_fee_metric >= marketCapUsd / 5` (both in USD units). Example: if `marketCapUsd = 250,000`, required fee metric is `50,000`; candidates below that are rejected as `fee_below_mcap_div_5`.
+
 **Settings you can edit live via `/settings`:**
 
 - `BUY_SIZE_SOL` — SOL per trade
