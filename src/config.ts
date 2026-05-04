@@ -62,17 +62,11 @@ if (!HELIUS_API_KEY) missing.push("HELIUS_API_KEY");
 if (!PRIV_B58) missing.push("PRIV_B58");
 
 if (missing.length > 0) {
-  if (DRY_RUN && missing.length === 1 && missing[0] === "PRIV_B58") {
-    console.warn("[config] DRY_RUN=true and PRIV_B58 missing — continuing without a signing key.");
-  } else if (DRY_RUN && missing.every((m) => m === "PRIV_B58")) {
-    console.warn("[config] DRY_RUN=true and PRIV_B58 missing — continuing without a signing key.");
+  if (DRY_RUN) {
+    const warning = missing.join(", ");
+    console.warn(`[config] DRY_RUN=true and missing env vars (${warning}) — continuing in non-trading mode.`);
   } else {
-    const hardMissing = missing.filter((m) => !(DRY_RUN && m === "PRIV_B58"));
-    if (hardMissing.length > 0) {
-      throw new Error(`Missing required env vars: ${hardMissing.join(", ")}`);
-    } else {
-      console.warn("[config] DRY_RUN=true and PRIV_B58 missing — continuing without a signing key.");
-    }
+    throw new Error(`Missing required env vars: ${missing.join(", ")}`);
   }
 }
 
