@@ -1559,7 +1559,19 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
   next.alert.sourceMeta = next.sourceMeta;
 
   const jupCfg = getRuntimeSettings().jupGate;
+  const dynamicFeeGate = getRuntimeSettings().gmgnStrategy.dynamicFeeGate;
   const audit = await fetchJupAudit(seed.mint);
+  if (dynamicFeeGate.enabled && dynamicFeeGate.mode === "marketcap_div_5") {
+    const requiredFee = Math.max(0, (next.marketCapUsd ?? 0) / 5);
+    const feeMetric = Math.max(0, audit?.fees ?? 0);
+    if (feeMetric < requiredFee) {
+      logger.info(
+        { mint: seed.mint, marketCapUsd: next.marketCapUsd ?? 0, feeMetric, requiredFee, mode: dynamicFeeGate.mode },
+        "[gmgn-source] rejected dynamic fee gate",
+      );
+      return { ok: false, reason: "fee_below_mcap_div_5" };
+    }
+  }
   const effectiveCfg: JupGateConfig = audit == null
     ? { ...jupCfg, minFees: 0, allowedScoreLabels: [] }
     : jupCfg;
