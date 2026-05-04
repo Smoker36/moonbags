@@ -110,6 +110,13 @@ function fmtClock(ts: number): string {
   return d.toTimeString().slice(0, 8); // "HH:MM:SS"
 }
 
+function extractVolumeRatio(reason?: string): string | null {
+  if (!reason) return null;
+  const m = reason.match(/volume\/mcap\((5m|1h|24h)\)\s+([0-9.]+x\s+<\s+[0-9.]+x)/i);
+  if (!m) return null;
+  return `VOL/MCAP ${m[1]} ${m[2]}`;
+}
+
 function AlertItem({ a, closed, info }: { a: Alert; closed?: ClosedTrade; info?: TokenInfo }) {
   const filtered = a.action === "filtered";
   const fired = a.action === "fired";
@@ -157,10 +164,13 @@ function AlertItem({ a, closed, info }: { a: Alert; closed?: ClosedTrade; info?:
       ? "bg-earth/20 text-earth"
       : "bg-coral/20 text-coral";
 
+  const volumeRatioLabel = extractVolumeRatio(a.reason);
+
   return (
     <div
-      className={`p-3 bg-surface-container-low border-l-2 ${borderClass} flex items-start justify-between rounded-r-sm ${filtered ? "opacity-60" : ""}`}
+      className={`p-3 bg-surface-container-low border-l-2 ${borderClass} rounded-r-sm ${filtered ? "opacity-60" : ""}`}
     >
+      <div className="flex items-start justify-between gap-2">
       <div className="flex items-start gap-2 min-w-0">
         <TokenAvatar icon={info?.icon} name={a.name} size={24} />
         <div className="min-w-0">
@@ -193,15 +203,19 @@ function AlertItem({ a, closed, info }: { a: Alert; closed?: ClosedTrade; info?:
                 {info.organicScoreLabel}
               </span>
             )}
-            {(info?.migrationSource || (a.sourceMeta?.migrationSource as string | undefined)) && (
-              <span className="px-1 bg-surface-container-highest text-[8px] font-mono text-muted-foreground uppercase">
-                MIG {(info?.migrationSource || String(a.sourceMeta?.migrationSource)).toLowerCase()}
+
               </span>
             )}
           </div>
         </div>
       </div>
       <div className="shrink-0 ml-2">{status}</div>
+      </div>
+      {a.reason && (
+        <div className="mt-2 text-[10px] font-mono text-muted-foreground break-words" title={a.reason}>
+          {a.reason}
+        </div>
+      )}
     </div>
   );
 }

@@ -70,7 +70,7 @@ const pendingExitEdits = new Map<number, ExitTargetEdit>();
 
 // Runtime (state/settings.json) settings that live outside SETTABLE_SPECS. The
 // Live Settings menu renders these as extra rows with their own callbacks.
-type RuntimeSettableKey = "JUP_GATE_ENABLED" | "JUP_GATE_MIN_FEES" | "JUP_GATE_SCORE_LABELS" | "JUP_GATE_ORG_VOL" | "JUP_GATE_ORG_BUYERS";
+type RuntimeSettableKey = "JUP_GATE_ENABLED" | "JUP_GATE_MIN_FEES" | "JUP_GATE_SCORE_LABELS" | "JUP_GATE_ORG_VOL" | "JUP_GATE_ORG_BUYERS" | "GMGN_DYNAMIC_FEE_GATE_ENABLED" | "GMGN_DYNAMIC_FEE_GATE_MODE";
 const pendingRuntimeEdits = new Map<number, RuntimeSettableKey>();
 
 const EXIT_STRATEGY_LABELS: Record<ExitStrategyMode, string> = {
@@ -533,11 +533,16 @@ async function sendAllSettingsMenu(chatId: number): Promise<void> {
   lines.push(`🔍 Jup score labels: <b>${escapeHtml(jupLabelsDisplay)}</b>`);
   lines.push(`🔍 Jup organic vol %: <b>${jupOrgVolDisplay}</b>`);
   lines.push(`🔍 Jup organic buyers %: <b>${jupOrgBuyersDisplay}</b>`);
+  const gmgnDyn = getRuntimeSettings().gmgnStrategy.dynamicFeeGate;
+  lines.push(`🧮 GMGN dynamic fee gate: <b>${gmgnDyn.enabled ? "on" : "off"}</b>`);
+  lines.push(`🧮 GMGN dynamic fee mode: <b>${escapeHtml(gmgnDyn.mode)}</b>`);
   buttons.push([{ text: `Toggle 🔍 Jup gate`, callback_data: "toggle:JUP_GATE_ENABLED" }]);
   buttons.push([{ text: `Edit 🔍 Jup minFees`, callback_data: "edit:JUP_GATE_MIN_FEES" }]);
   buttons.push([{ text: `Edit 🔍 Jup score labels`, callback_data: "edit:JUP_GATE_SCORE_LABELS" }]);
   buttons.push([{ text: `Edit 🔍 Jup organic vol %`, callback_data: "edit:JUP_GATE_ORG_VOL" }]);
   buttons.push([{ text: `Edit 🔍 Jup organic buyers %`, callback_data: "edit:JUP_GATE_ORG_BUYERS" }]);
+  buttons.push([{ text: `Toggle 🧮 GMGN dynamic fee gate`, callback_data: "toggle:GMGN_DYNAMIC_FEE_GATE_ENABLED" }]);
+  buttons.push([{ text: `Edit 🧮 GMGN dynamic fee mode`, callback_data: "edit:GMGN_DYNAMIC_FEE_GATE_MODE" }]);
 
   await tgPost("sendMessage", {
     chat_id: chatId,
@@ -610,6 +615,8 @@ const RUNTIME_EDIT_LABELS: Record<RuntimeSettableKey, string> = {
   JUP_GATE_SCORE_LABELS: "🔍 Jup score labels",
   JUP_GATE_ORG_VOL: "🔍 Jup organic vol %",
   JUP_GATE_ORG_BUYERS: "🔍 Jup organic buyers %",
+  GMGN_DYNAMIC_FEE_GATE_ENABLED: "🧮 GMGN dynamic fee gate",
+  GMGN_DYNAMIC_FEE_GATE_MODE: "🧮 GMGN dynamic fee mode",
 };
 
 function formatRuntimeCurrent(key: RuntimeSettableKey): string {
@@ -618,6 +625,8 @@ function formatRuntimeCurrent(key: RuntimeSettableKey): string {
   if (key === "JUP_GATE_MIN_FEES") return String(cfg.minFees);
   if (key === "JUP_GATE_ORG_VOL") return cfg.minOrganicVolumePct > 0 ? `${cfg.minOrganicVolumePct}%` : "off";
   if (key === "JUP_GATE_ORG_BUYERS") return cfg.minOrganicBuyersPct > 0 ? `${cfg.minOrganicBuyersPct}%` : "off";
+  if (key === "GMGN_DYNAMIC_FEE_GATE_ENABLED") return getRuntimeSettings().gmgnStrategy.dynamicFeeGate.enabled ? "on" : "off";
+  if (key === "GMGN_DYNAMIC_FEE_GATE_MODE") return getRuntimeSettings().gmgnStrategy.dynamicFeeGate.mode;
   const labels = cfg.allowedScoreLabels;
   return labels.length > 0 ? labels.join(",") : "(any)";
 }
@@ -630,6 +639,8 @@ async function promptForRuntimeEdit(chatId: number, key: RuntimeSettableKey): Pr
       ? `(comma-separated — e.g. "medium,high" or leave empty for any)`
       : (key === "JUP_GATE_ORG_VOL" || key === "JUP_GATE_ORG_BUYERS")
         ? `(0–100 — e.g. 5 for ≥5%; set 0 to disable)`
+        : key === "GMGN_DYNAMIC_FEE_GATE_MODE"
+          ? `(currently only: marketcap_div_5)`
         : "";
   const resp = await tgPost("sendMessage", {
     chat_id: chatId,
@@ -674,6 +685,12 @@ async function applyRuntimeEdit(chatId: number, key: RuntimeSettableKey, raw: st
         if (key === "JUP_GATE_ORG_VOL") draft.jupGate.minOrganicVolumePct = n;
         else draft.jupGate.minOrganicBuyersPct = n;
       });
+    } else if (key === "GMGN_DYNAMIC_FEE_GATE_MODE") {
+      if (trimmed !== "marketcap_div_5") {
+        await tgPost("sendMessage", { chat_id: chatId, text: `❌ Expected \"marketcap_div_5\"`, parse_mode: "HTML" });
+        return;
+      }
+      updateRuntimeSettings((draft) => { draft.gmgnStrategy.dynamicFeeGate.mode = "marketcap_div_5"; });
     } else {
       // JUP_GATE_ENABLED — shouldn't be routed here (it's a toggle), but
       // accept truthy/falsy text as a fallback.
@@ -683,7 +700,10 @@ async function applyRuntimeEdit(chatId: number, key: RuntimeSettableKey, raw: st
         await tgPost("sendMessage", { chat_id: chatId, text: `❌ Could not update <b>${RUNTIME_EDIT_LABELS[key]}</b>: expected on/off`, parse_mode: "HTML" });
         return;
       }
-      updateRuntimeSettings((draft) => { draft.jupGate.enabled = on; });
+      updateRuntimeSettings((draft) => {
+        if (key === "JUP_GATE_ENABLED") draft.jupGate.enabled = on;
+        else draft.gmgnStrategy.dynamicFeeGate.enabled = on;
+      });
     }
   } catch (err) {
     await tgPost("sendMessage", { chat_id: chatId, text: `❌ Could not update <b>${RUNTIME_EDIT_LABELS[key]}</b>: ${escapeHtml((err as Error).message)}`, parse_mode: "HTML" });
@@ -1026,7 +1046,7 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
   if (data.startsWith("edit:")) {
     const rawKey = data.slice(5);
     // Route runtime-settings edits (jupGate) separately from SETTABLE_SPECS.
-    if (rawKey === "JUP_GATE_MIN_FEES" || rawKey === "JUP_GATE_SCORE_LABELS" || rawKey === "JUP_GATE_ENABLED" || rawKey === "JUP_GATE_ORG_VOL" || rawKey === "JUP_GATE_ORG_BUYERS") {
+    if (rawKey === "JUP_GATE_MIN_FEES" || rawKey === "JUP_GATE_SCORE_LABELS" || rawKey === "JUP_GATE_ENABLED" || rawKey === "JUP_GATE_ORG_VOL" || rawKey === "JUP_GATE_ORG_BUYERS" || rawKey === "GMGN_DYNAMIC_FEE_GATE_ENABLED" || rawKey === "GMGN_DYNAMIC_FEE_GATE_MODE") {
       await tgPost("answerCallbackQuery", { callback_query_id: cq.id });
       await promptForRuntimeEdit(chatId, rawKey);
       return;
@@ -1044,9 +1064,14 @@ async function handleCallback(cq: NonNullable<Update["callback_query"]>): Promis
   if (data.startsWith("toggle:")) {
     const rawKey = data.slice(7);
     // Route jupGate toggle separately — it lives in runtime settings, not env.
-    if (rawKey === "JUP_GATE_ENABLED") {
-      updateRuntimeSettings((draft) => { draft.jupGate.enabled = !draft.jupGate.enabled; });
-      const after = getRuntimeSettings().jupGate.enabled;
+    if (rawKey === "JUP_GATE_ENABLED" || rawKey === "GMGN_DYNAMIC_FEE_GATE_ENABLED") {
+      updateRuntimeSettings((draft) => {
+        if (rawKey === "JUP_GATE_ENABLED") draft.jupGate.enabled = !draft.jupGate.enabled;
+        else draft.gmgnStrategy.dynamicFeeGate.enabled = !draft.gmgnStrategy.dynamicFeeGate.enabled;
+      });
+      const after = rawKey === "JUP_GATE_ENABLED"
+        ? getRuntimeSettings().jupGate.enabled
+        : getRuntimeSettings().gmgnStrategy.dynamicFeeGate.enabled;
       await tgPost("answerCallbackQuery", {
         callback_query_id: cq.id,
         text: `🔍 Jup gate: ${after ? "on" : "off"}`,
