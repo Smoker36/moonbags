@@ -164,10 +164,13 @@ function AlertItem({ a, closed, info }: { a: Alert; closed?: ClosedTrade; info?:
       ? "bg-earth/20 text-earth"
       : "bg-coral/20 text-coral";
 
+  const volumeRatioLabel = extractVolumeRatio(a.reason);
+
   return (
     <div
-      className={`p-3 bg-surface-container-low border-l-2 ${borderClass} flex items-start justify-between rounded-r-sm ${filtered ? "opacity-60" : ""}`}
+      className={`p-3 bg-surface-container-low border-l-2 ${borderClass} rounded-r-sm ${filtered ? "opacity-60" : ""}`}
     >
+      <div className="flex items-start justify-between gap-2">
       <div className="flex items-start gap-2 min-w-0">
         <TokenAvatar icon={info?.icon} name={a.name} size={24} />
         <div className="min-w-0">
@@ -200,17 +203,18 @@ function AlertItem({ a, closed, info }: { a: Alert; closed?: ClosedTrade; info?:
                 {info.organicScoreLabel}
               </span>
             )}
-            {extractVolumeRatio(a.reason) && (
+            {volumeRatioLabel && (
               <span className="px-1 bg-surface-container-highest text-[8px] font-mono text-coral uppercase">
-                {extractVolumeRatio(a.reason)}
+                {volumeRatioLabel}
               </span>
             )}
           </div>
         </div>
       </div>
       <div className="shrink-0 ml-2">{status}</div>
+      </div>
       {a.reason && (
-        <div className="mt-2 text-[10px] font-mono text-muted-foreground truncate" title={a.reason}>
+        <div className="mt-2 text-[10px] font-mono text-muted-foreground break-words" title={a.reason}>
           {a.reason}
         </div>
       )}
