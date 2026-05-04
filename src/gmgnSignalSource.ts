@@ -612,6 +612,7 @@ function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
 } {
   const sourceMeta = candidate.sourceMeta ?? {};
   const raw = candidate.raw ?? {};
+  const rawPlatform = typeof raw.platform === "string" ? raw.platform.toLowerCase() : "";
 
   // Check pumpfun platform indicators
   const isPumpPlatform =
@@ -619,7 +620,6 @@ function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
     sourceMeta.platform === "Pump.fun" ||
     sourceMeta.platform === "pump_mayhem" ||
     raw.launchpad === "pump" ||
-    (getMaybeString(raw.platform)?.toLowerCase().includes("pump") ?? false);
 
   if (!isPumpPlatform) {
     return { isMigrated: false, confidence: 0 };
@@ -780,6 +780,25 @@ function maybeReject(candidate: Partial<GmgnSignalCandidate>, _reason: string): 
     return `creator ${(candidate.creatorBalancePct ?? 0).toFixed(0)}% > ${filters.maxCreatorBalancePct}%`;
   }
 
+  const dynamicFeeGate = runtime.gmgnStrategy.dynamicFeeGate;
+  if (dynamicFeeGate.enabled && dynamicFeeGate.mode === "marketcap_div_5") {
+    const feeMetric = runtime.jupGate.minFees;
+    const requiredFee = Math.max(0, mcap / 5);
+    if (feeMetric < requiredFee) {
+      logger.info(
+        {
+          mint: candidate.mint,
+          marketCapUsd: mcap,
+          feeMetric,
+          requiredFee,
+          mode: dynamicFeeGate.mode,
+        },
+        "[gmgn-source] rejected dynamic fee gate",
+      );
+      return "fee_below_mcap_div_5";
+    }
+  }
+
   // ===== CUSTOM STRATEGY: Marketcap Fee Check =====
   if (filters.minMarketCapFeeUsd > 0) {
     const feeCheck = checkMarketCapFee(candidate, filters.minMarketCapFeeUsd);
@@ -878,7 +897,7 @@ function maybeRejectTrigger(candidate: GmgnSignalCandidate, settings: GmgnSettin
       const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
       const dump = detectPostMigrationDump(candidate, { priceUsd: firstPrice, holders: firstHolders });
       if (dump.dropPct >= settings.filters.minPriceDropPctAfterMigration) {
-        candidate.sourceMeta = { ...candidate.sourceMeta, dumpDetection: { isDumping: dump.isDumping, dropPct: dump.dropPct, holderTrend: dump.holderTrend } };
+
       } else {
         return `post-migration drop ${dump.dropPct.toFixed(1)}% < ${settings.filters.minPriceDropPctAfterMigration}%`;
       }
@@ -1526,7 +1545,19 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
   next.alert.sourceMeta = next.sourceMeta;
 
   const jupCfg = getRuntimeSettings().jupGate;
+  const dynamicFeeGate = getRuntimeSettings().gmgnStrategy.dynamicFeeGate;
   const audit = await fetchJupAudit(seed.mint);
+  if (dynamicFeeGate.enabled && dynamicFeeGate.mode === "marketcap_div_5") {
+    const requiredFee = Math.max(0, (next.marketCapUsd ?? 0) / 5);
+    const feeMetric = Math.max(0, audit?.fees ?? 0);
+    if (feeMetric < requiredFee) {
+      logger.info(
+        { mint: seed.mint, marketCapUsd: next.marketCapUsd ?? 0, feeMetric, requiredFee, mode: dynamicFeeGate.mode },
+        "[gmgn-source] rejected dynamic fee gate",
+      );
+      return { ok: false, reason: "fee_below_mcap_div_5" };
+    }
+  }
   const effectiveCfg: JupGateConfig = audit == null
     ? { ...jupCfg, minFees: 0, allowedScoreLabels: [] }
     : jupCfg;
