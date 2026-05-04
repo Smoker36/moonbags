@@ -80,6 +80,12 @@ type GmgnSettings = {
     maxBotPct: number;
     maxCreatorBalancePct: number;
     requireNotWashTrading: boolean;
+    // ===== CUSTOM STRATEGY FILTERS =====
+    minMarketCapFeeUsd: number;
+    minVolumeMcapRatio: number;
+    requirePumpfunMigration: boolean;
+    minPriceDropPctAfterMigration: number;
+    minRsiForDump: number;
   };
   trigger: {
     minScans: number;
@@ -142,6 +148,7 @@ type GmgnWatchEntry = {
   firstSeenAt?: number;
   firstHolders?: number;
   firstLiquidityUsd?: number;
+  firstPrice?: number;
   name: string;
   symbol?: string;
   logo?: string;
@@ -214,11 +221,6 @@ const DEFAULT_SETTINGS: GmgnSettings = {
   sourceMode: "scg_only",
   chains: ["sol"],
   trending: {
-    // [TRENDING-ENABLED 2026-04-22] /v1/market/rank returns full token
-    // profiles (holder_count, smart_degen_count, renowned_count), so
-    // trending seeds pass the baseline filter without requiring upfront
-    // enrichment. Deep-dive via /v1/token/info + /v1/token/security is
-    // invoked just before emit to reconfirm the filters.
     enabled: true,
     interval: "1h",
     limit: 10,
@@ -228,7 +230,6 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     platforms: [],
   },
   trenches: {
-    // Gated off 2026-04-22 — kept intact for future re-enable.
     enabled: false,
     limit: 10,
     types: ["new_creation", "near_completion", "completed"],
@@ -238,10 +239,6 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     sortBy: "smart_degen_count",
   },
   signal: {
-    // Gated off 2026-04-22 — /v1/market/token_signal rows miss
-    // holder_count + smart_degen_count, so signal seeds always failed
-    // the baseline filter. Re-enable after the deep-dive pipeline is
-    // proven on trending seeds.
     enabled: false,
     limit: 10,
     groups: [{ signal_type: [12] }],
@@ -270,6 +267,12 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     maxBotPct: 45,
     maxCreatorBalancePct: 20,
     requireNotWashTrading: true,
+    // ===== CUSTOM STRATEGY DEFAULTS =====
+    minMarketCapFeeUsd: 700,
+    minVolumeMcapRatio: 10,
+    requirePumpfunMigration: true,
+    minPriceDropPctAfterMigration: 15,
+    minRsiForDump: 0,
   },
   trigger: {
     minScans: 10,
@@ -430,6 +433,12 @@ function currentSettings(): GmgnSettings {
         baseline.requireNotWashTrading === undefined
           ? DEFAULT_SETTINGS.filters.requireNotWashTrading
           : Boolean(baseline.requireNotWashTrading),
+      // ===== CUSTOM STRATEGY FILTERS =====
+      minMarketCapFeeUsd: Math.max(0, finite(filters.minMarketCapFeeUsd, DEFAULT_SETTINGS.filters.minMarketCapFeeUsd)),
+      minVolumeMcapRatio: Math.max(0, finite(filters.minVolumeMcapRatio, DEFAULT_SETTINGS.filters.minVolumeMcapRatio)),
+      requirePumpfunMigration: filters.requirePumpfunMigration === undefined ? DEFAULT_SETTINGS.filters.requirePumpfunMigration : Boolean(filters.requirePumpfunMigration),
+      minPriceDropPctAfterMigration: Math.max(0, finite(filters.minPriceDropPctAfterMigration, DEFAULT_SETTINGS.filters.minPriceDropPctAfterMigration)),
+      minRsiForDump: Math.max(0, Math.min(100, finite(filters.minRsiForDump, DEFAULT_SETTINGS.filters.minRsiForDump))),
     },
     trigger: {
       minScans: Math.max(1, Math.min(20, Math.round(finite(trigger.minScans, DEFAULT_SETTINGS.trigger.minScans)))),
@@ -582,6 +591,134 @@ function buildAlert(candidate: GmgnSignalCandidate): ScgAlert {
   };
 }
 
+// ===== CUSTOM STRATEGY HELPER FUNCTIONS =====
+
+/**
+ * Detect if token was migrated from Pumpfun
+ */
+function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
+  isMigrated: boolean;
+  confidence: number;
+  migrationTime?: number;
+} {
+  const sourceMeta = candidate.sourceMeta ?? {};
+  const raw = candidate.raw ?? {};
+
+  // Check pumpfun platform indicators
+  const isPumpPlatform =
+    candidate.source === "trenches" ||
+    sourceMeta.platform === "Pump.fun" ||
+    sourceMeta.platform === "pump_mayhem" ||
+    raw.launchpad === "pump" ||
+    raw.platform?.toLowerCase?.().includes("pump");
+
+  if (!isPumpPlatform) {
+    return { isMigrated: false, confidence: 0 };
+  }
+
+  // Check recent age (migration within 30 mins)
+  const ageMs = Date.now() - (candidate.timestamp ?? Date.now());
+  const ageMins = ageMs / 60_000;
+  const recentAge = ageMins < 30;
+
+  // Creator balance typically high on pump.fun
+  const creatorPctHigh = (candidate.creatorBalancePct ?? 0) > 15;
+
+  // Confidence scoring
+  let confidence = 0;
+  if (isPumpPlatform) confidence += 40;
+  if (recentAge) confidence += 35;
+  if (creatorPctHigh) confidence += 25;
+
+  return {
+    isMigrated: confidence >= 50,
+    confidence,
+    migrationTime: candidate.timestamp,
+  };
+}
+
+/**
+ * Detect post-migration dump phase
+ */
+function detectPostMigrationDump(
+  candidate: Partial<GmgnSignalCandidate>,
+  firstState?: { priceUsd: number; holders: number }
+): {
+  isDumping: boolean;
+  dropPct: number;
+  holderTrend: "growing" | "stable" | "declining";
+} {
+  const currentPrice = candidate.priceUsd ?? 0;
+  const initialPrice = firstState?.priceUsd ?? currentPrice;
+  const dropPct = initialPrice > 0 ? ((initialPrice - currentPrice) / initialPrice) * 100 : 0;
+
+  const currentHolders = candidate.holders ?? 0;
+  const initialHolders = firstState?.holders ?? currentHolders;
+  const holderChange = initialHolders > 0 ? ((currentHolders - initialHolders) / initialHolders) * 100 : 0;
+
+  let holderTrend: "growing" | "stable" | "declining" = "stable";
+  if (holderChange > 10) holderTrend = "growing";
+  else if (holderChange < -5) holderTrend = "declining";
+
+  return {
+    isDumping: dropPct >= 15,
+    dropPct,
+    holderTrend,
+  };
+}
+
+/**
+ * Check volume to marketcap ratio
+ */
+function checkVolumeMcapRatio(
+  candidate: Partial<GmgnSignalCandidate>,
+  minRatio: number = 10
+): {
+  hasGoodRatio: boolean;
+  ratio: number;
+  volume24h?: number;
+} {
+  const mcap = candidate.marketCapUsd ?? 0;
+  const volume =
+    (candidate.sourceMeta?.volume_24h as number) ??
+    (candidate.sourceMeta?.volume24h as number) ??
+    0;
+
+  if (mcap <= 0 || volume <= 0) {
+    return { hasGoodRatio: false, ratio: 0 };
+  }
+
+  const ratio = volume / mcap;
+  return {
+    hasGoodRatio: ratio >= minRatio,
+    ratio: ratio,
+    volume24h: volume,
+  };
+}
+
+/**
+ * Check marketcap / 5 >= fee minimum (5 SOL equivalent)
+ */
+function checkMarketCapFee(
+  candidate: Partial<GmgnSignalCandidate>,
+  minFeeUsd: number
+): {
+  passesFeeCheck: boolean;
+  feeEquivalent: number;
+  mcap: number;
+} {
+  const mcap = candidate.marketCapUsd ?? 0;
+  const feeEquivalent = mcap / 5;
+
+  return {
+    passesFeeCheck: feeEquivalent >= minFeeUsd,
+    feeEquivalent,
+    mcap,
+  };
+}
+
+// ===== END CUSTOM STRATEGY HELPERS =====
+
 function maybeReject(candidate: Partial<GmgnSignalCandidate>, _reason: string): string | null {
   const filters = currentSettings().filters;
   const runtime = getRuntimeSettings();
@@ -619,12 +756,6 @@ function maybeReject(candidate: Partial<GmgnSignalCandidate>, _reason: string): 
   if ((candidate.kolCount ?? 0) < filters.minKolCount) {
     return `KOL count ${Math.round(candidate.kolCount ?? 0)} < ${filters.minKolCount}`;
   }
-  // [GMGN-FIELD-MISSING] rug_ratio is not exposed by any GMGN open-API
-  // endpoint. Leaving the check active would be a no-op (always 0); disabling
-  // so users aren't misled into thinking the filter runs.
-  // if ((candidate.rugRatio ?? 0) > filters.maxRugRatio) {
-  //   return `rug ratio ${(candidate.rugRatio ?? 0).toFixed(2)} > ${filters.maxRugRatio}`;
-  // }
   if ((candidate.top10Pct ?? 0) > filters.maxTop10Pct) {
     return `top10 ${Math.round(candidate.top10Pct ?? 0)}% > ${filters.maxTop10Pct}%`;
   }
@@ -637,12 +768,36 @@ function maybeReject(candidate: Partial<GmgnSignalCandidate>, _reason: string): 
   if ((candidate.creatorBalancePct ?? 0) > filters.maxCreatorBalancePct) {
     return `creator ${(candidate.creatorBalancePct ?? 0).toFixed(0)}% > ${filters.maxCreatorBalancePct}%`;
   }
-  // [GMGN-FIELD-MISSING] is_wash_trading is not exposed. Proxy via
-  // top_rat_trader_percentage (ratTraderPct) and top_bot_degen_percentage
-  // which already gate through maxBotPct above.
-  // if (filters.requireNotWashTrading && candidate.isWashTrading) {
-  //   return "wash trading flagged";
-  // }
+
+  // ===== CUSTOM STRATEGY: Marketcap Fee Check =====
+  if (filters.minMarketCapFeeUsd > 0) {
+    const feeCheck = checkMarketCapFee(candidate, filters.minMarketCapFeeUsd);
+    if (!feeCheck.passesFeeCheck) {
+      return `mcap fee $${Math.round(feeCheck.feeEquivalent)} < $${Math.round(filters.minMarketCapFeeUsd)} (need 5+ SOL equivalent)`;
+    }
+  }
+
+  // ===== CUSTOM STRATEGY: Pumpfun Migration Detection =====
+  if (filters.requirePumpfunMigration) {
+    const migration = detectPumpfunMigration(candidate);
+    if (!migration.isMigrated) {
+      return `not migrated from pumpfun (confidence ${migration.confidence}%)`;
+    }
+    // Store migration data for later use
+    candidate.sourceMeta = {
+      ...candidate.sourceMeta,
+      pumpfunDetection: { ...migration },
+    };
+  }
+
+  // ===== CUSTOM STRATEGY: Volume / Marketcap Ratio =====
+  if (filters.minVolumeMcapRatio > 0) {
+    const volumeCheck = checkVolumeMcapRatio(candidate, filters.minVolumeMcapRatio);
+    if (!volumeCheck.hasGoodRatio) {
+      return `volume/mcap ${volumeCheck.ratio.toFixed(2)}x < ${filters.minVolumeMcapRatio}x`;
+    }
+  }
+
   if (filters.requireNoHoneypot && candidate.isHoneypot) {
     return "honeypot flagged";
   }
@@ -702,6 +857,67 @@ function maybeRejectTrigger(candidate: GmgnSignalCandidate, settings: GmgnSettin
   const liquidityDropPct = firstLiquidity > 0 ? Math.max(0, ((firstLiquidity - candidate.liquidityUsd) / firstLiquidity) * 100) : 0;
   if (liquidityDropPct > trigger.maxLiquidityDropPct) {
     return `liquidity drop ${liquidityDropPct.toFixed(0)}% > ${trigger.maxLiquidityDropPct}%`;
+  }
+
+  // ===== CUSTOM STRATEGY: Post-Migration Dump Detection =====
+  if (
+    settings.filters.requirePumpfunMigration &&
+    settings.filters.minPriceDropPctAfterMigration > 0
+  ) {
+    const migration = detectPumpfunMigration(candidate);
+    if (migration.isMigrated) {
+      const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
+      const dump = detectPostMigrationDump(candidate, {
+        priceUsd: firstPrice,
+        holders: firstHolders,
+      });
+
+      if (dump.dropPct >= settings.filters.minPriceDropPctAfterMigration) {
+        candidate.sourceMeta = {
+          ...candidate.sourc// ===== CUSTOM STRATEGY: Dump to Bottom Detection =====
+if (settings.filters.requirePumpfunMigration) {
+  const migration = detectPumpfunMigration(candidate);
+  if (migration.isMigrated) {
+    // Track lowest price since migration
+    const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
+    const currentPrice = candidate.priceUsd ?? 0;
+    const lowestPrice = existing?.sourceMeta?.lowestPrice ?? firstPrice;
+    
+    // Update lowest price if current is lower
+    const newLowestPrice = Math.min(lowestPrice, currentPrice);
+    
+    // Check if price is at bottom (below lowest by small margin, then starting to recover)
+    const maxDropPct = ((firstPrice - newLowestPrice) / firstPrice) * 100;
+    const isRecovering = currentPrice > newLowestPrice * 1.02; // 2% above lowest = sign of recovery
+    const isAtBottom = newLowestPrice > 0 && maxDropPct > 10 && isRecovering; // Min 10% dump + signs of recovery
+    
+    if (isAtBottom) {
+      candidate.sourceMeta = {
+        ...candidate.sourceMeta,
+        bottomDetection: {
+          isAtBottom: true,
+          currentPrice,
+          lowestPrice: newLowestPrice,
+          maxDropPct: Math.round(maxDropPct * 100) / 100,
+          isRecovering,
+        },
+      };
+    } else {
+      // Still dumping or waiting for recovery
+      return `dumping to bottom... current: $${currentPrice.toFixed(6)}, lowest: $${newLowestPrice.toFixed(6)}, drop: ${maxDropPct.toFixed(1)}%`;
+    }
+  }
+}eMeta,
+          dumpDetection: {
+            isDumping: dump.isDumping,
+            dropPct: dump.dropPct,
+            holderTrend: dump.holderTrend,
+          },
+        };
+      } else {
+        return `post-migration drop ${dump.dropPct.toFixed(1)}% < ${settings.filters.minPriceDropPctAfterMigration}%`;
+      }
+    }
   }
 
   const smartOrKol = candidate.smartMoneyCount + candidate.kolCount;
@@ -781,6 +997,7 @@ function upsertWatchEntry(
     firstSeenAt: existing?.firstSeenAt ?? Date.now(),
     firstHolders: existing?.firstHolders ?? (enriched ? candidate.holders : undefined),
     firstLiquidityUsd: existing?.firstLiquidityUsd ?? (enriched ? candidate.liquidityUsd : undefined),
+    firstPrice: existing?.firstPrice ?? (enriched ? candidate.priceUsd : undefined),
     name: candidate.name,
     symbol: candidate.symbol,
     logo: candidate.logo,
@@ -865,6 +1082,7 @@ function hydrateWatchEntry(raw: unknown): GmgnWatchEntry | null {
     lastSeenAt: Number(rec.lastSeenAt ?? Date.now()) || Date.now(),
     firstHolders: Number(rec.firstHolders ?? rec.holders ?? 0) || 0,
     firstLiquidityUsd: Number(rec.firstLiquidityUsd ?? rec.liquidityUsd ?? 0) || 0,
+    firstPrice: Number(rec.firstPrice ?? 0) || 0,
     status: rec.status === "accepted" || rec.status === "filtered" || rec.status === "dedup" ? rec.status : "watch",
     reason: getMaybeString(rec.reason),
     score: Number(rec.score ?? 0) || 0,
@@ -983,10 +1201,6 @@ function baseSeedFromRow(source: GmgnSourceKind, chain: GmgnChain, row: GmgnRow)
   const liquidityUsd = parseNumber(getStringField(row, ["liquidity", "liquidityUsd"]) ?? row.liquidity ?? 0);
   const holders = Math.round(parseNumber(getStringField(row, ["holder_count", "holders", "holderCount"]) ?? row.holder_count ?? 0));
   const smartMoneyCountRaw = Math.round(parseNumber(getStringField(row, ["smart_degen_count", "smartMoneyCount"]) ?? row.smart_degen_count ?? 0));
-  // A row returned from /v1/market/token_signal IS a smart-money buy by
-  // definition, so ensure smartMoneyCount is at least 1 even when the
-  // upstream row omits the count field. Left in place for when the
-  // "signal" source is re-enabled.
   const smartMoneyCount = source === "signal" ? Math.max(1, smartMoneyCountRaw) : smartMoneyCountRaw;
   const kolCount = Math.round(parseNumber(getStringField(row, ["renowned_count", "kol_count", "kolCount"]) ?? row.renowned_count ?? 0));
   const sniperCount = Math.round(parseNumber(getStringField(row, ["sniper_count", "sniperCount"]) ?? row.sniper_count ?? 0));
@@ -1077,13 +1291,11 @@ async function enrichSeed(seed: GmgnSignalCandidate): Promise<GmgnSignalCandidat
     next.liquidityUsd = parseNumber(infoObj.liquidity ?? next.liquidityUsd);
     next.holders = Math.round(parseNumber(infoObj.holder_count ?? next.holders));
 
-    // GMGN nests wallet counts under info.wallet_tags_stat.*
     const tags = (infoObj.wallet_tags_stat ?? {}) as Record<string, unknown>;
     next.smartMoneyCount = Math.max(next.smartMoneyCount, Math.round(parseNumber(tags.smart_wallets)));
     next.kolCount = Math.max(next.kolCount, Math.round(parseNumber(tags.renowned_wallets)));
     next.sniperCount = Math.max(next.sniperCount, Math.round(parseNumber(tags.sniper_wallets)));
 
-    // GMGN nests rates under info.stat.*
     const stat = (infoObj.stat ?? {}) as Record<string, unknown>;
     next.top10Pct = Math.max(next.top10Pct, maybeRatioPct(parseNumber(stat.top_10_holder_rate) || next.top10Pct));
     next.bundlerPct = Math.max(next.bundlerPct, maybeRatioPct(parseNumber(stat.top_bundler_trader_percentage ?? stat.bot_degen_rate)));
@@ -1107,12 +1319,7 @@ async function enrichSeed(seed: GmgnSignalCandidate): Promise<GmgnSignalCandidat
     next.renouncedMint = getMaybeBool(securityObj.renounced_mint) ?? getMaybeBool(securityObj.mint_renounced) ?? next.renouncedMint;
     next.renouncedFreeze =
       getMaybeBool(securityObj.renounced_freeze_account) ?? getMaybeBool(securityObj.freeze_renounced) ?? next.renouncedFreeze;
-    // top_10_holder_rate also appears on the security endpoint — use whichever is larger.
     next.top10Pct = Math.max(next.top10Pct, maybeRatioPct(parseNumber(securityObj.top_10_holder_rate ?? securityObj.top10_holder_rate)));
-    // NOTE: GMGN's open API does not expose `rug_ratio`, `is_wash_trading`, or a
-    // direct `creator_balance_rate` on the security endpoint. `rugRatio` and
-    // `isWashTrading` filters below are effectively always-pass and are
-    // retained only so the shared ScgAlert type stays populated.
     next.sourceMeta = {
       ...next.sourceMeta,
       security: securityObj,
@@ -1286,25 +1493,10 @@ type DeepDiveResult =
   | { ok: true; candidate: GmgnSignalCandidate }
   | { ok: false; reason: string };
 
-// Deep-dive enrichment: called just before a candidate would emit, after
-// baseline + trigger have already passed on the seed-level data. Pulls
-// /v1/token/info + /v1/token/security in parallel and fills ONLY missing
-// fields on the candidate (does not override richer seed data). Callers
-// should re-check baseline filters on the returned candidate.
-//
-// Also applies the Jupiter datapi audit gate (fees + organicScoreLabel) before
-// emit. GMGN-specific: when Jup has no data for a token (not indexed — common
-// for new/small tokens), we pass through and rely on GMGN-native signals.
-// When Jup DOES have data, fees + scoreLabel are enforced as configured.
-//
-// Returns { ok:false, reason } if the Jup gate rejects on indexed tokens.
 async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveResult> {
   let info: Record<string, unknown> | null = null;
   let security: Record<string, unknown> | null = null;
 
-  // Only fetch info/security for sparse sources (signal, trenches).
-  // Trending and watchlist seeds arrive pre-enriched from /v1/market/rank —
-  // the deep-dive calls add nothing and only burn rate-limit quota.
   const needsEnrichment = seed.source === "signal" || seed.source === "trenches";
   if (needsEnrichment) {
     try {
@@ -1325,19 +1517,16 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
   const next: GmgnSignalCandidate = { ...seed, sourceMeta: { ...seed.sourceMeta } };
   const stat = (info && typeof info.stat === "object" && info.stat ? (info.stat as Record<string, unknown>) : {}) as Record<string, unknown>;
 
-  // holder_count → holders (only if seed had 0/missing)
   if (!next.holders || next.holders <= 0) {
     const holderCount = info ? parseNumber(info.holder_count) : 0;
     if (holderCount > 0) next.holders = Math.round(holderCount);
   }
 
-  // liquidity → liquidityUsd (only if missing)
   if (!next.liquidityUsd || next.liquidityUsd <= 0) {
     const liq = info ? parseNumber(info.liquidity) : 0;
     if (liq > 0) next.liquidityUsd = liq;
   }
 
-  // rug_ratio → rugRatio (only if missing or 0)
   if (!next.rugRatio || next.rugRatio <= 0) {
     const rug = security
       ? parseNumber(security.rug_ratio)
@@ -1345,7 +1534,6 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
     if (rug > 0) next.rugRatio = rug;
   }
 
-  // top_10_holder_rate → top10Pct (only if missing)
   if (!next.top10Pct || next.top10Pct <= 0) {
     const t10 = parseNumber(
       (security && (security.top_10_holder_rate ?? security.top10_holder_rate)) ??
@@ -1355,7 +1543,6 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
     if (t10 > 0) next.top10Pct = maybeRatioPct(t10);
   }
 
-  // bundler_rate → bundlerPct (only if missing)
   if (!next.bundlerPct || next.bundlerPct <= 0) {
     const b = parseNumber(
       (info && info.bundler_rate) ??
@@ -1366,7 +1553,6 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
     if (b > 0) next.bundlerPct = maybeRatioPct(b);
   }
 
-  // is_wash_trading → isWashTrading (only if not set)
   if (!next.isWashTrading) {
     const wash =
       (info && getMaybeBool(info.is_wash_trading)) ??
@@ -1380,17 +1566,11 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
     deepDive: { info: info ?? null, security: security ?? null },
   };
 
-  // Refresh score + alert so /sources-status and downstream consumers
-  // see the enriched numbers.
   next.score = scoreFromData(next);
   next.alert = buildAlert(next);
   next.alert.score = next.score;
   next.alert.sourceMeta = next.sourceMeta;
 
-  // Jup audit gate — enforce fees + organicScoreLabel when Jupiter has data.
-  // When audit is null (token not indexed — too new/small), pass through and
-  // rely on GMGN-native signals. This lets new micro-caps through while still
-  // catching indexed tokens with zero organic score (e.g. bot-coordinated pumps).
   const jupCfg = getRuntimeSettings().jupGate;
   const audit = await fetchJupAudit(seed.mint);
   const effectiveCfg: JupGateConfig = audit == null
@@ -1463,10 +1643,6 @@ async function processSeed(seed: GmgnSignalCandidate, settings: GmgnSettings): P
     return;
   }
 
-  // Deep-dive: pull /v1/token/info + /v1/token/security once we know the
-  // candidate would otherwise fire. This backfills any fields missing
-  // from the seed (holders, liquidity, rug_ratio, top10, bundler,
-  // is_wash_trading) and gives us a last chance to reject bad tokens.
   const deepDive = await deepDiveCandidate(seed);
   if (!deepDive.ok) {
     const reason = `deep-dive: ${deepDive.reason}`;
@@ -1475,7 +1651,6 @@ async function processSeed(seed: GmgnSignalCandidate, settings: GmgnSettings): P
     return;
   }
   const enriched = deepDive.candidate;
-  // Reuse lastCandidate so /sources-status reflects the enriched numbers.
   lastCandidate = enriched;
   const deepDiveReason = maybeReject(enriched, "deep-dive");
   if (deepDiveReason) {
@@ -1568,19 +1743,8 @@ async function runCycle(): Promise<void> {
     const firstPoll = await persistAndMaybeSeed(seeds, settings, "scanner");
     if (firstPoll) return;
 
-    // shouldProcessSeed was already applied inside fetchSeeds. Do NOT
-    // re-check in this loop — persistAndMaybeSeed above just upserted
-    // each seed's sourceKey into the watchlist, which would make
-    // shouldProcessSeed return false for every seed and silently skip
-    // all processing.
     for (const seed of seeds) {
       try {
-        // Trending seeds from /v1/market/rank include a full profile
-        // (holder_count, smart_degen_count, renowned_count, liquidity,
-        // etc.), so baseline can run directly against the seed. The
-        // deep-dive enrichment happens inside processSeed just before
-        // emit — this keeps API usage to ~2 calls per accepted
-        // candidate rather than per seed.
         await processSeed(seed, settings);
       } catch (err) {
         lastError = (err as Error).message;
