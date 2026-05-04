@@ -83,9 +83,16 @@ type GmgnSettings = {
     // ===== CUSTOM STRATEGY FILTERS =====
     minMarketCapFeeUsd: number;
     minVolumeMcapRatio: number;
+    minVolumeToMcapRatio: number;
+    volumeToMcapWindow: "5m" | "1h" | "24h";
     requirePumpfunMigration: boolean;
     minPriceDropPctAfterMigration: number;
     minRsiForDump: number;
+    recoveryMinReboundPct: number;
+    recoveryLookbackScans: number;
+    recoveryMinHigherLows: number;
+    recoveryMinBuySellRatio: number;
+    recoveryRequirePositiveNetFlow: boolean;
   };
   trigger: {
     minScans: number;
@@ -136,6 +143,8 @@ export type GmgnSignalCandidate = {
   renouncedFreeze: boolean;
   isOnCurve: boolean;
   sourceMeta: Record<string, unknown>;
+  recoveryConfirmedAt?: number;
+  recoveryReason?: string;
   raw: GmgnRow;
   alert: ScgAlert;
 };
@@ -163,6 +172,8 @@ type GmgnWatchEntry = {
   top10Pct: number;
   rugRatio: number;
   sourceMeta: Record<string, unknown>;
+  recoveryConfirmedAt?: number;
+  recoveryReason?: string;
 };
 
 type GmgnSnapshot = {
@@ -279,9 +290,16 @@ const DEFAULT_SETTINGS: GmgnSettings = {
     // ===== CUSTOM STRATEGY DEFAULTS =====
     minMarketCapFeeUsd: 700,
     minVolumeMcapRatio: 10,
+    minVolumeToMcapRatio: 10,
+    volumeToMcapWindow: "24h",
     requirePumpfunMigration: true,
     minPriceDropPctAfterMigration: 15,
     minRsiForDump: 0,
+    recoveryMinReboundPct: 2,
+    recoveryLookbackScans: 4,
+    recoveryMinHigherLows: 2,
+    recoveryMinBuySellRatio: 1.1,
+    recoveryRequirePositiveNetFlow: true,
   },
   trigger: {
     minScans: 10,
@@ -446,9 +464,22 @@ function currentSettings(): GmgnSettings {
       // ===== CUSTOM STRATEGY FILTERS =====
       minMarketCapFeeUsd: Math.max(0, finite(filters.minMarketCapFeeUsd, DEFAULT_SETTINGS.filters.minMarketCapFeeUsd)),
       minVolumeMcapRatio: Math.max(0, finite(filters.minVolumeMcapRatio, DEFAULT_SETTINGS.filters.minVolumeMcapRatio)),
+      minVolumeToMcapRatio: Math.max(0, finite(filters.minVolumeToMcapRatio ?? filters.minVolumeMcapRatio, DEFAULT_SETTINGS.filters.minVolumeToMcapRatio)),
+      volumeToMcapWindow:
+        filters.volumeToMcapWindow === "5m" || filters.volumeToMcapWindow === "1h" || filters.volumeToMcapWindow === "24h"
+          ? filters.volumeToMcapWindow
+          : DEFAULT_SETTINGS.filters.volumeToMcapWindow,
       requirePumpfunMigration: filters.requirePumpfunMigration === undefined ? DEFAULT_SETTINGS.filters.requirePumpfunMigration : Boolean(filters.requirePumpfunMigration),
       minPriceDropPctAfterMigration: Math.max(0, finite(filters.minPriceDropPctAfterMigration, DEFAULT_SETTINGS.filters.minPriceDropPctAfterMigration)),
       minRsiForDump: Math.max(0, Math.min(100, finite(filters.minRsiForDump, DEFAULT_SETTINGS.filters.minRsiForDump))),
+      recoveryMinReboundPct: Math.max(0, finite(filters.recoveryMinReboundPct, DEFAULT_SETTINGS.filters.recoveryMinReboundPct)),
+      recoveryLookbackScans: Math.max(2, Math.min(10, Math.round(finite(filters.recoveryLookbackScans, DEFAULT_SETTINGS.filters.recoveryLookbackScans)))),
+      recoveryMinHigherLows: Math.max(1, Math.min(5, Math.round(finite(filters.recoveryMinHigherLows, DEFAULT_SETTINGS.filters.recoveryMinHigherLows)))),
+      recoveryMinBuySellRatio: Math.max(0, finite(filters.recoveryMinBuySellRatio, DEFAULT_SETTINGS.filters.recoveryMinBuySellRatio)),
+      recoveryRequirePositiveNetFlow:
+        filters.recoveryRequirePositiveNetFlow === undefined
+          ? DEFAULT_SETTINGS.filters.recoveryRequirePositiveNetFlow
+          : Boolean(filters.recoveryRequirePositiveNetFlow),
     },
     trigger: {
       minScans: Math.max(1, Math.min(20, Math.round(finite(trigger.minScans, DEFAULT_SETTINGS.trigger.minScans)))),
@@ -613,6 +644,7 @@ function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
 } {
   const sourceMeta = candidate.sourceMeta ?? {};
   const raw = candidate.raw ?? {};
+  const rawPlatform = typeof raw.platform === "string" ? raw.platform.toLowerCase() : "";
 
   // Check pumpfun platform indicators
   const isPumpPlatform =
@@ -620,7 +652,7 @@ function detectPumpfunMigration(candidate: Partial<GmgnSignalCandidate>): {
     sourceMeta.platform === "Pump.fun" ||
     sourceMeta.platform === "pump_mayhem" ||
     raw.launchpad === "pump" ||
-    String(raw.platform ?? "").toLowerCase().includes("pump");
+
 
   if (!isPumpPlatform) {
     return { isMigrated: false, confidence: 0 };
@@ -716,27 +748,29 @@ function updatePostMigrationTracker(mint: string, currentPrice: number, now: num
  */
 function checkVolumeMcapRatio(
   candidate: Partial<GmgnSignalCandidate>,
-  minRatio: number = 10
+  minRatio: number = 10,
+  window: "5m" | "1h" | "24h" = "24h"
 ): {
   hasGoodRatio: boolean;
   ratio: number;
-  volume24h?: number;
+  volumeWindowUsd: number;
+  window: "5m" | "1h" | "24h";
 } {
   const mcap = candidate.marketCapUsd ?? 0;
-  const volume =
-    (candidate.sourceMeta?.volume_24h as number) ??
-    (candidate.sourceMeta?.volume24h as number) ??
-    0;
+  const meta = candidate.sourceMeta ?? {};
+  const volumeByWindow = {
+    "5m": Number((meta.volume_5m as number) ?? (meta.volume5m as number) ?? 0),
+    "1h": Number((meta.volume_1h as number) ?? (meta.volume1h as number) ?? 0),
+    "24h": Number((meta.volume_24h as number) ?? (meta.volume24h as number) ?? 0),
+  } as const;
+  const volumeWindowUsd = Number.isFinite(volumeByWindow[window]) ? Math.max(0, volumeByWindow[window]) : 0;
+  const volumeToMcap = mcap > 0 ? volumeWindowUsd / mcap : 0;
 
-  if (mcap <= 0 || volume <= 0) {
-    return { hasGoodRatio: false, ratio: 0 };
-  }
-
-  const ratio = volume / mcap;
   return {
-    hasGoodRatio: ratio >= minRatio,
-    ratio: ratio,
-    volume24h: volume,
+    hasGoodRatio: volumeToMcap >= minRatio,
+    ratio: volumeToMcap,
+    volumeWindowUsd,
+    window,
   };
 }
 
@@ -813,6 +847,25 @@ function maybeReject(candidate: Partial<GmgnSignalCandidate>, _reason: string): 
     return `creator ${(candidate.creatorBalancePct ?? 0).toFixed(0)}% > ${filters.maxCreatorBalancePct}%`;
   }
 
+  const dynamicFeeGate = runtime.gmgnStrategy.dynamicFeeGate;
+  if (dynamicFeeGate.enabled && dynamicFeeGate.mode === "marketcap_div_5") {
+    const feeMetric = runtime.jupGate.minFees;
+    const requiredFee = Math.max(0, mcap / 5);
+    if (feeMetric < requiredFee) {
+      logger.info(
+        {
+          mint: candidate.mint,
+          marketCapUsd: mcap,
+          feeMetric,
+          requiredFee,
+          mode: dynamicFeeGate.mode,
+        },
+        "[gmgn-source] rejected dynamic fee gate",
+      );
+      return "fee_below_mcap_div_5";
+    }
+  }
+
   // ===== CUSTOM STRATEGY: Marketcap Fee Check =====
   if (filters.minMarketCapFeeUsd > 0) {
     const feeCheck = checkMarketCapFee(candidate, filters.minMarketCapFeeUsd);
@@ -835,10 +888,18 @@ function maybeReject(candidate: Partial<GmgnSignalCandidate>, _reason: string): 
   }
 
   // ===== CUSTOM STRATEGY: Volume / Marketcap Ratio =====
-  if (filters.minVolumeMcapRatio > 0) {
-    const volumeCheck = checkVolumeMcapRatio(candidate, filters.minVolumeMcapRatio);
+  if (filters.minVolumeToMcapRatio > 0) {
+    const volumeCheck = checkVolumeMcapRatio(candidate, filters.minVolumeToMcapRatio, filters.volumeToMcapWindow);
+    candidate.sourceMeta = {
+      ...candidate.sourceMeta,
+      volumeToMcap: volumeCheck.ratio,
+      volumeToMcapWindow: volumeCheck.window,
+      volumeWindowUsd: volumeCheck.volumeWindowUsd,
+      marketCapUsd: mcap,
+      minVolumeToMcapRatio: filters.minVolumeToMcapRatio,
+    };
     if (!volumeCheck.hasGoodRatio) {
-      return `volume/mcap ${volumeCheck.ratio.toFixed(2)}x < ${filters.minVolumeMcapRatio}x`;
+      return `volume/mcap(${volumeCheck.window}) ${volumeCheck.ratio.toFixed(2)}x < ${filters.minVolumeToMcapRatio}x`;
     }
   }
 
@@ -880,103 +941,100 @@ function gmgnSnapshotCount(mint: string): number {
   }, 0);
 }
 
+function evaluateRecovery(
+  candidate: GmgnSignalCandidate,
+  existing: GmgnWatchEntry | undefined,
+  settings: GmgnSettings
+): { ok: boolean; reason: string; confirmedAt?: number; postMigrationLowPrice: number } {
+  const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
+  const currentPrice = candidate.priceUsd ?? 0;
+  const priorLow = getMaybeNumber(existing?.sourceMeta?.postMigrationLowPrice) ?? firstPrice;
+  const postMigrationLowPrice = priorLow > 0 ? Math.min(priorLow, currentPrice) : currentPrice;
+  const reboundPct = postMigrationLowPrice > 0 ? ((currentPrice - postMigrationLowPrice) / postMigrationLowPrice) * 100 : 0;
+  const minReboundPct = settings.filters.recoveryMinReboundPct;
+  if (reboundPct < minReboundPct) {
+    return { ok: false, reason: "recovery_not_confirmed", postMigrationLowPrice };
+  }
+
+  const historyRaw = Array.isArray(existing?.sourceMeta?.recentScans) ? existing?.sourceMeta?.recentScans : [];
+  const recentScans = [...historyRaw, { priceUsd: currentPrice }].slice(-settings.filters.recoveryLookbackScans);
+  let higherLows = 0;
+  for (let i = 1; i < recentScans.length; i++) {
+    const prev = getMaybeNumber((recentScans[i - 1] as Record<string, unknown>).priceUsd) ?? 0;
+    const curr = getMaybeNumber((recentScans[i] as Record<string, unknown>).priceUsd) ?? 0;
+    if (prev > 0 && curr > prev) higherLows++;
+  }
+  if (higherLows < settings.filters.recoveryMinHigherLows) {
+    return { ok: false, reason: "recovery_not_confirmed", postMigrationLowPrice };
+  }
+
+  const ratio = gmgnBuySellRatio(candidate) ?? 0;
+  const buyCount = getMaybeNumber(candidate.sourceMeta?.buy_count) ?? getMaybeNumber(candidate.sourceMeta?.buyCount) ?? 0;
+  const sellCount = getMaybeNumber(candidate.sourceMeta?.sell_count) ?? getMaybeNumber(candidate.sourceMeta?.sellCount) ?? 0;
+  const netFlow = buyCount - sellCount;
+  if (ratio < settings.filters.recoveryMinBuySellRatio) {
+    return { ok: false, reason: "recovery_not_confirmed", postMigrationLowPrice };
+  }
+  if (settings.filters.recoveryRequirePositiveNetFlow && netFlow <= 0) {
+    return { ok: false, reason: "recovery_not_confirmed", postMigrationLowPrice };
+  }
+
+  return {
+    ok: true,
+    reason: `rebound ${reboundPct.toFixed(1)}%, higher-lows ${higherLows}/${recentScans.length - 1}, buy/sell ${ratio.toFixed(2)}, netFlow ${netFlow}`,
+    confirmedAt: existing?.recoveryConfirmedAt ?? Date.now(),
+    postMigrationLowPrice,
+  };
+}
+
 function maybeRejectTrigger(candidate: GmgnSignalCandidate, settings: GmgnSettings): string | null {
   const trigger = settings.trigger;
   const existing = watchlist.get(candidate.mint);
   const scans = Math.max(existing ? 1 : 0, gmgnSnapshotCount(candidate.mint));
-  if (scans < trigger.minScans) {
-    return `scans ${scans} < ${trigger.minScans}`;
-  }
+  if (scans < trigger.minScans) return `scans ${scans} < ${trigger.minScans}`;
 
   const firstHolders = existing?.firstHolders ?? candidate.holders;
   const holderGrowthPct = firstHolders > 0 ? ((candidate.holders - firstHolders) / firstHolders) * 100 : 0;
-  if (holderGrowthPct < trigger.minHolderGrowthPct) {
-    return `holder growth ${holderGrowthPct.toFixed(1)}% < ${trigger.minHolderGrowthPct}%`;
-  }
+  if (holderGrowthPct < trigger.minHolderGrowthPct) return `holder growth ${holderGrowthPct.toFixed(1)}% < ${trigger.minHolderGrowthPct}%`;
   if (trigger.maxHolderGrowthPct > 0 && holderGrowthPct > trigger.maxHolderGrowthPct) {
     return `holder growth ${holderGrowthPct.toFixed(1)}% > ${trigger.maxHolderGrowthPct}% (bot inflation)`;
   }
 
   const firstLiquidity = existing?.firstLiquidityUsd ?? candidate.liquidityUsd;
   const liquidityDropPct = firstLiquidity > 0 ? Math.max(0, ((firstLiquidity - candidate.liquidityUsd) / firstLiquidity) * 100) : 0;
-  if (liquidityDropPct > trigger.maxLiquidityDropPct) {
-    return `liquidity drop ${liquidityDropPct.toFixed(0)}% > ${trigger.maxLiquidityDropPct}%`;
-  }
+  if (liquidityDropPct > trigger.maxLiquidityDropPct) return `liquidity drop ${liquidityDropPct.toFixed(0)}% > ${trigger.maxLiquidityDropPct}%`;
 
-  // ===== CUSTOM STRATEGY: Post-migration low tracking + dump gating =====
-  clearExpiredPostMigrationTrackers(Date.now());
-  const migration = settings.filters.requirePumpfunMigration ? detectPumpfunMigration(candidate) : { isMigrated: false, confidence: 0 };
-  if (migration.isMigrated) {
-    const currentPrice = Math.max(0, candidate.priceUsd ?? 0);
-    const tracker = updatePostMigrationTracker(candidate.mint, currentPrice, Date.now());
-    const distanceFromLowPct = tracker.postMigrationLowPrice > 0
-      ? ((tracker.lastObservedPrice - tracker.postMigrationLowPrice) / tracker.postMigrationLowPrice) * 100
-      : 0;
+
+
+    }
+    const recovery = evaluateRecovery(candidate, existing, settings);
+    candidate.recoveryConfirmedAt = recovery.confirmedAt;
+    candidate.recoveryReason = recovery.ok ? recovery.reason : undefined;
+    if (!recovery.ok) return "recovery_not_confirmed";
     candidate.sourceMeta = {
       ...candidate.sourceMeta,
-      postMigrationLowPrice: tracker.postMigrationLowPrice,
-      postMigrationLowAt: tracker.postMigrationLowAt,
-      lastObservedPrice: tracker.lastObservedPrice,
-      bottomDetection: {
-        isAtBottom: tracker.lastObservedPrice <= tracker.postMigrationLowPrice,
-        lowPrice: tracker.postMigrationLowPrice,
-        distanceFromLowPct: Math.round(distanceFromLowPct * 100) / 100,
-      },
+      postMigrationLowPrice: recovery.postMigrationLowPrice,
+      recoveryConfirmedAt: recovery.confirmedAt,
+      recoveryReason: recovery.reason,
+      recentScans: [
+        ...(Array.isArray(existing?.sourceMeta?.recentScans) ? existing?.sourceMeta?.recentScans : []),
+        { at: Date.now(), priceUsd: candidate.priceUsd },
+      ].slice(-settings.filters.recoveryLookbackScans),
     };
-    logger.info(
-      {
-        mint: candidate.mint,
-        current: tracker.lastObservedPrice,
-        low: tracker.postMigrationLowPrice,
-        distanceFromLowPct: Math.round(distanceFromLowPct * 100) / 100,
-      },
-      "[gmgn-source] post-migration bottom tracker",
-    );
-
-    if (settings.filters.minPriceDropPctAfterMigration > 0) {
-      const firstPrice = existing?.firstPrice ?? candidate.priceUsd ?? 0;
-      const dump = detectPostMigrationDump(candidate, {
-        priceUsd: firstPrice,
-        holders: firstHolders,
-      });
-      if (dump.dropPct >= settings.filters.minPriceDropPctAfterMigration) {
-        candidate.sourceMeta = {
-          ...candidate.sourceMeta,
-          dumpDetection: {
-            isDumping: dump.isDumping,
-            dropPct: dump.dropPct,
-            holderTrend: dump.holderTrend,
-          },
-        };
-      } else {
-        return `post-migration drop ${dump.dropPct.toFixed(1)}% < ${settings.filters.minPriceDropPctAfterMigration}%`;
-      }
-    }
   }
 
   const smartOrKol = candidate.smartMoneyCount + candidate.kolCount;
-  if (smartOrKol < trigger.minSmartOrKolCount) {
-    return `smart/KOL ${smartOrKol} < ${trigger.minSmartOrKolCount}`;
-  }
+  if (smartOrKol < trigger.minSmartOrKolCount) return `smart/KOL ${smartOrKol} < ${trigger.minSmartOrKolCount}`;
 
   const ratio = gmgnBuySellRatio(candidate);
-  if (ratio !== undefined && ratio < trigger.minBuySellRatio) {
-    return `buy/sell ${ratio.toFixed(2)} < ${trigger.minBuySellRatio}`;
-  }
+  if (ratio !== undefined && ratio < trigger.minBuySellRatio) return `buy/sell ${ratio.toFixed(2)} < ${trigger.minBuySellRatio}`;
 
-  candidate.sourceMeta = {
-    ...candidate.sourceMeta,
-    scans,
-    holderGrowthPct,
-    liquidityDropPct,
-    buySellRatio: ratio,
-  };
+  candidate.sourceMeta = { ...candidate.sourceMeta, scans, holderGrowthPct, liquidityDropPct, buySellRatio: ratio };
   candidate.alert.sourceMeta = candidate.sourceMeta;
   candidate.alert.holder_growth_pct = holderGrowthPct;
   candidate.alert.bs_ratio = ratio ?? 0;
   return null;
 }
-
 function reject(candidate: Partial<GmgnSignalCandidate> | null, source: GmgnSourceKind, reason: string): void {
   candidatesFiltered++;
   const row = {
@@ -1046,6 +1104,8 @@ function upsertWatchEntry(
     top10Pct: candidate.top10Pct,
     rugRatio: candidate.rugRatio,
     sourceMeta: candidate.sourceMeta,
+    recoveryConfirmedAt: candidate.recoveryConfirmedAt ?? existing?.recoveryConfirmedAt,
+    recoveryReason: candidate.recoveryReason ?? existing?.recoveryReason,
   };
   if (existing) {
     watchlist.set(candidate.mint, { ...existing, ...entry, firstSeenAt: existing.firstSeenAt ?? Date.now() });
@@ -1126,6 +1186,8 @@ function hydrateWatchEntry(raw: unknown): GmgnWatchEntry | null {
     top10Pct: Number(rec.top10Pct ?? 0) || 0,
     rugRatio: Number(rec.rugRatio ?? 0) || 0,
     sourceMeta: (rec.sourceMeta && typeof rec.sourceMeta === "object" ? rec.sourceMeta : {}) as Record<string, unknown>,
+    recoveryConfirmedAt: Number(rec.recoveryConfirmedAt ?? 0) || undefined,
+    recoveryReason: getMaybeString(rec.recoveryReason),
   };
 }
 
@@ -1606,7 +1668,19 @@ async function deepDiveCandidate(seed: GmgnSignalCandidate): Promise<DeepDiveRes
   next.alert.sourceMeta = next.sourceMeta;
 
   const jupCfg = getRuntimeSettings().jupGate;
+  const dynamicFeeGate = getRuntimeSettings().gmgnStrategy.dynamicFeeGate;
   const audit = await fetchJupAudit(seed.mint);
+  if (dynamicFeeGate.enabled && dynamicFeeGate.mode === "marketcap_div_5") {
+    const requiredFee = Math.max(0, (next.marketCapUsd ?? 0) / 5);
+    const feeMetric = Math.max(0, audit?.fees ?? 0);
+    if (feeMetric < requiredFee) {
+      logger.info(
+        { mint: seed.mint, marketCapUsd: next.marketCapUsd ?? 0, feeMetric, requiredFee, mode: dynamicFeeGate.mode },
+        "[gmgn-source] rejected dynamic fee gate",
+      );
+      return { ok: false, reason: "fee_below_mcap_div_5" };
+    }
+  }
   const effectiveCfg: JupGateConfig = audit == null
     ? { ...jupCfg, minFees: 0, allowedScoreLabels: [] }
     : jupCfg;
